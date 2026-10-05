@@ -8,7 +8,7 @@ mongoose.connect(E.MONGODB_URI).then(() => console.log('MongoDB connected')).cat
 const Movie = mongoose.model('Movie', new mongoose.Schema({
   sourceUrl: { type: String, unique: true }, type: { type: String, default: 'movie' },
   title: String, year: String, poster: String, overview: String, rating: String, runtime: String,
-  director: String, country: String, cast: [String], featured: { type: Boolean, default: false },
+  director: String, country: String, cast: [String], genres: [String], featured: { type: Boolean, default: false },
   downloads: [{ label: String, url: String }],
   episodes: [{ season: Number, number: String, title: String, url: String }]
 }, { timestamps: true }));
@@ -29,6 +29,22 @@ async function cine(p, params, tries = 2) {
 }
 const isTv = l => (l || '').includes('/tvshows/');
 
+// ---- chamindu API: movies (search + info with resolved download links) ----
+const CH = 'https://api.chamindu.site/api/v1/movies/cinesubz';
+async function ch(p, params) {
+  const u = new URL(CH + p);
+  Object.entries(params).forEach(([k, v]) => u.searchParams.set(k, v));
+  u.searchParams.set('api_key', E.CHAMINDU_API_KEY);
+  const r = await fetch(u); if (!r.ok) throw new Error('API error ' + r.status);
+  const j = await r.json(); if (!j.status || !j.data) throw new Error('API returned no data');
+  return j.data;
+}
+const linkCache = new Map(); // direct links carry tokens, so keep them fresh (10 min)
+async function infodl(link) {
+  const c = linkCache.get(link); if (c && Date.now() - c.t < 6e5) return c.d;
+  const d = await ch('/infodl', { q: link }); linkCache.set(link, { t: Date.now(), d }); return d;
+}
+
 async function build(link) {
   if (isTv(link)) {
     const d = (await cine('/cinesubz/tvshow', { url: link })).data;
@@ -38,12 +54,12 @@ async function build(link) {
     }).filter(e => e.url);
     return { sourceUrl: link, type: 'tv', title: d.title, year: d.year, poster: d.poster, overview: d.description, rating: d.rating?.score ? String(d.rating.score) : '', episodes };
   }
-  const d = (await cine('/cinesubz/details', { url: link })).data;
+  const d = await infodl(link);
   return {
-    sourceUrl: link, type: 'movie', title: d.title, year: d.year, poster: d.poster, overview: d.description,
-    rating: d.imdb_rating ? d.imdb_rating + '/10' : '', runtime: d.runtime, director: d.director, country: d.country,
-    cast: Array.isArray(d.cast) ? d.cast : d.cast ? [d.cast] : [],
-    downloads: (d.downloads || []).filter(x => x && x.quality && x.url).map(x => ({ label: x.quality, url: x.url }))
+    sourceUrl: link, type: 'movie', title: d.title, year: d.year, poster: d.image,
+    overview: (d.story || '').split('\n\n')[0].slice(0, 700), rating: d.rating && d.rating !== 'N/A' ? d.rating : '',
+    runtime: d.duration, director: d.director, country: d.country,
+    cast: (d.cast || []).slice(0, 8).map(c => c.name), genres: (d.genres || []).filter(g => !g.startsWith('#'))
   };
 }
 const allowed = new Set(); // episode links we handed out
@@ -84,6 +100,12 @@ app.get('/api/resolve', wrap(async (req, res) => {
   pick ? res.json({ url: pick.url }) : res.status(404).json({ error: 'No download link available right now' });
 }));
 
+app.get('/api/links/:id', wrap(async (req, res) => {
+  const m = await Movie.findById(req.params.id); if (!m) return res.status(404).json({ error: 'Not found' });
+  const d = await infodl(m.sourceUrl);
+  res.json({ links: (d.downloads || []).filter(x => x.link && !/telegram/i.test(x.quality)).map(x => ({ label: x.quality, size: x.size, url: x.link })) });
+}));
+
 // ---------- admin ----------
 app.post('/api/login', (req, res) => {
   const { user, pass } = req.body || {};
@@ -91,8 +113,8 @@ app.post('/api/login', (req, res) => {
   res.status(401).json({ error: 'Wrong username or password' });
 });
 app.get('/api/admin/search', auth, wrap(async (req, res) => {
-  const d = await cine('/cinesubz/search', { query: req.query.q || '' });
-  res.json((d.results || []).slice(0, 25).map(x => ({ title: x.title, link: x.link, type: isTv(x.link) ? 'tv' : 'movie', poster: x.poster || x.image || x.thumbnail || x.img || '' })));
+  const d = await ch('/search', { q: req.query.q || '' });
+  res.json(d.slice(0, 25).map(x => ({ title: x.title, link: x.link, type: x.type === 'tvshows' || isTv(x.link) ? 'tv' : 'movie', poster: x.image || '' })));
 }));
 app.get('/api/admin/movies', auth, wrap(async (req, res) => res.json(await Movie.find().sort({ createdAt: -1 }))));
 app.post('/api/admin/import', auth, wrap(async (req, res) => {

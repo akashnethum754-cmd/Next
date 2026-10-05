@@ -9,7 +9,7 @@ const Movie = mongoose.model('Movie', new mongoose.Schema({
   sourceUrl: { type: String, unique: true }, type: { type: String, default: 'movie' },
   title: String, year: String, poster: String, overview: String, rating: String, runtime: String,
   director: String, country: String, cast: [String], genres: [String], featured: { type: Boolean, default: false },
-  downloads: [{ label: String, url: String }],
+  downloads: [{ label: String, size: String, url: String }], linksAt: Date,
   episodes: [{ season: Number, number: String, title: String, url: String }]
 }, { timestamps: true }));
 
@@ -35,7 +35,7 @@ async function ch(p, params) {
   const u = new URL(CH + p);
   Object.entries(params).forEach(([k, v]) => u.searchParams.set(k, v));
   u.searchParams.set('api_key', E.CHAMINDU_API_KEY);
-  const r = await fetch(u); if (!r.ok) throw new Error('API error ' + r.status);
+  const r = await fetch(u, { signal: AbortSignal.timeout(25000) }); if (!r.ok) throw new Error('API error ' + r.status);
   const j = await r.json(); if (!j.status || !j.data) throw new Error('API returned no data');
   return j.data;
 }
@@ -43,6 +43,18 @@ const linkCache = new Map(); // direct links carry tokens, so keep them fresh (1
 async function infodl(link) {
   const c = linkCache.get(link); if (c && Date.now() - c.t < 6e5) return c.d;
   const d = await ch('/infodl', { q: link }); linkCache.set(link, { t: Date.now(), d }); return d;
+}
+const toLinks = d => (d.downloads || []).filter(x => x.link && !/telegram/i.test(x.quality)).map(x => ({ label: x.quality, size: x.size, url: x.link }));
+const inflight = new Map();
+function freshLinks(m) { // fetch new links, save them in MongoDB (shared by simultaneous requests)
+  const k = String(m._id);
+  if (!inflight.has(k)) inflight.set(k, (async () => {
+    linkCache.delete(m.sourceUrl);
+    const downloads = toLinks(await infodl(m.sourceUrl));
+    await Movie.findByIdAndUpdate(m._id, { downloads, linksAt: new Date() });
+    return downloads;
+  })().finally(() => inflight.delete(k)));
+  return inflight.get(k);
 }
 
 async function build(link) {
@@ -58,8 +70,9 @@ async function build(link) {
   return {
     sourceUrl: link, type: 'movie', title: d.title, year: d.year, poster: d.image,
     overview: (d.story || '').split('\n\n')[0].slice(0, 700), rating: d.rating && d.rating !== 'N/A' ? d.rating : '',
-    runtime: d.duration, director: d.director, country: d.country,
-    cast: (d.cast || []).slice(0, 8).map(c => c.name), genres: (d.genres || []).filter(g => !g.startsWith('#'))
+    runtime: d.duration, director: d.director, country: [...new Set((d.country || '').split(',').map(x => x.trim()).filter(Boolean))].join(', '),
+    cast: (d.cast || []).slice(0, 8).map(c => c.name), genres: (d.genres || []).filter(g => !/^[#.]/.test(g) && !/^(hdcam|cam)$/i.test(g)),
+    downloads: toLinks(d), linksAt: new Date()
   };
 }
 const allowed = new Set(); // episode links we handed out
@@ -106,9 +119,14 @@ app.get('/api/resolve', wrap(async (req, res) => {
 }));
 
 app.get('/api/links/:id', wrap(async (req, res) => {
-  const m = await Movie.findById(req.params.id); if (!m) return res.status(404).json({ error: 'Not found' });
-  const d = await infodl(m.sourceUrl);
-  res.json({ links: (d.downloads || []).filter(x => x.link && !/telegram/i.test(x.quality)).map(x => ({ label: x.quality, size: x.size, url: x.link })) });
+  const m = await Movie.findById(req.params.id, 'sourceUrl downloads linksAt');
+  if (!m) return res.status(404).json({ error: 'Not found' });
+  if (m.downloads.length) { // saved links open instantly; old ones refresh in the background
+    const stale = Date.now() - (m.linksAt?.getTime() || 0) > 20 * 60e3;
+    if (stale) freshLinks(m).catch(e => console.error('links refresh:', e.message));
+    return res.json({ stale, links: m.downloads.map(x => ({ label: x.label, size: x.size, url: x.url })) });
+  }
+  res.json({ links: await freshLinks(m) });
 }));
 
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
@@ -144,10 +162,15 @@ async function searchAll(q) {
   return out;
 }
 async function doSearch(chat, s, q) {
-  const r = (await searchAll(q)).slice(0, 10); s.res = r;
-  if (!r.length) return say(chat, 'No results. Try another spelling, for example <code>salaar</code>.', [BACK]);
-  const have = new Set((await Movie.find({ sourceUrl: { $in: r.map(x => x.link) } }, 'sourceUrl')).map(x => x.sourceUrl));
-  say(chat, `Results for <b>${H(q)}</b>. Tap one to add it:`, [...r.map((x, i) => [{ text: `${have.has(x.link) ? '✓ ' : ''}${x.type === 'tv' ? '📺' : '🎬'} ${clean(x.title).slice(0, 46)}`, callback_data: 'a:' + i }]), BACK]);
+  tg('sendChatAction', { chat_id: chat, action: 'typing' });
+  const w = await say(chat, `🔍 Searching <b>${H(q)}</b>…`), c = { chat, mid: w.result?.message_id };
+  try {
+    const r = (await searchAll(q)).slice(0, 10); s.res = r; s.q = q;
+    if (!r.length) return show(c, 'No results. Try another spelling, for example <code>salaar</code>.', [BACK]);
+    const have = new Set((await Movie.find({ sourceUrl: { $in: r.map(x => x.link) } }, 'sourceUrl')).map(x => x.sourceUrl));
+    s.kb = [...r.map((x, i) => [{ text: `${have.has(x.link) ? '✓ ' : ''}${x.type === 'tv' ? '📺' : '🎬'} ${clean(x.title).slice(0, 46)}`, callback_data: 'a:' + i }]), BACK];
+    show(c, `Results for <b>${H(q)}</b>. Tap one to add it:`, s.kb);
+  } catch (e) { show(c, '⚠️ ' + H(e.message), [BACK]); }
 }
 async function itemView(c, id) {
   const m = await Movie.findById(id); if (!m) return show(c, 'Not found.', [BACK]);
@@ -174,14 +197,17 @@ async function act(c, s, d) {
   if (k === 'l') return listView(c, a, +b || 0);
   if (k === 'm') return itemView(c, a);
   if (k === 'f') { const m = await Movie.findById(a); await Movie.findByIdAndUpdate(a, { featured: !m.featured }); return itemView(c, a); }
-  if (k === 'r') { const m = await Movie.findById(a); await Movie.findByIdAndUpdate(a, await build(m.sourceUrl)); return itemView(c, a); }
+  if (k === 'r') { await show(c, '⏳ Refreshing…'); const m = await Movie.findById(a); linkCache.delete(m.sourceUrl); await Movie.findByIdAndUpdate(a, await build(m.sourceUrl)); return itemView(c, a); }
+  if (k === 'rs') return show(c, `Results for <b>${H(s.q || '')}</b>. Tap one to add it:`, s.kb || [BACK]);
   if (k === 'd') return show(c, '⚠️ Delete this title?', [[{ text: '✅ Yes, delete', callback_data: 'D:' + a }, { text: 'Cancel', callback_data: 'm:' + a }]]);
   if (k === 'D') { await Movie.findByIdAndDelete(a); return show(c, '🗑 Deleted.', [BACK]); }
   if (k === 'a') {
-    const x = s.res[+a]; if (!x) return say(c.chat, 'Search again.', [BACK]);
+    const x = s.res[+a]; if (!x) return show(c, 'Search again.', [BACK]);
+    await show(c, `⏳ Adding <b>${H(clean(x.title))}</b>… a few seconds`);
     const doc = await build(x.link);
     await Movie.findOneAndUpdate({ sourceUrl: doc.sourceUrl }, doc, { upsert: true, new: true });
-    return say(c.chat, `✅ Added: <b>${H(clean(doc.title))}</b>`, [[{ text: '🔍 Search more', callback_data: 's' }, ...BACK]]);
+    const row = s.kb?.[+a]?.[0]; if (row) row.text = '✓ ' + row.text.replace(/^✓ /, '');
+    return show(c, `✅ Added: <b>${H(clean(doc.title))}</b>`, [[{ text: '📋 Back to results', callback_data: 'rs' }], [{ text: '🔍 New search', callback_data: 's' }, ...BACK]]);
   }
 }
 async function handle(u) {

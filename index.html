@@ -88,19 +88,29 @@ function show(html){$('#mb').innerHTML='<button class="x" onclick="hide()" aria-
 function hide(){$('#m').classList.remove('on')}
 $('#m').onclick=e=>{if(e.target.id==='m')hide()};
 document.onkeydown=e=>{if(e.key==='Escape')hide()};
+function dlBtn(l,u){return `<button class="btn" data-u="${esc(u)}" onclick="getDl(this)">Download ${esc(l)}</button>`}
+async function getDl(b){const o=b.textContent;b.disabled=true;b.textContent='Getting link…';
+  try{const r=await api('/resolve?url='+encodeURIComponent(b.dataset.u));location.href=r.url}catch(e){alert(e.message)}
+  b.disabled=false;b.textContent=o}
+let S={};
+function tvHtml(m){S={};m.episodes.forEach(e=>(S[e.season]=S[e.season]||[]).push(e));
+  const ks=Object.keys(S);if(!ks.length)return '<p class="meta" style="margin-top:12px">Episodes coming soon.</p>';
+  return `<div style="margin-top:14px"><select id="ss" onchange="eps()" class="btn alt" style="background:var(--bg)">${ks.map(k=>`<option value="${k}">Season ${k}</option>`).join('')}</select></div><div id="el"></div><div id="eq" class="dl" style="border:0"></div>`}
+function eps(){const s=$('#ss').value;$('#eq').innerHTML='';
+  $('#el').innerHTML=(S[s]||[]).map((e,i)=>`<div class="row"><div class="t">Episode ${esc(e.number)} · ${esc(e.title)}</div><button class="btn sm" onclick="epq('${s}',${i},this)">Download</button></div>`).join('')}
+async function epq(s,i,b){const e=S[s][i];b.disabled=true;
+  try{const r=await api('/episode?url='+encodeURIComponent(e.url));
+    $('#eq').innerHTML=`<span class="meta" style="width:100%">Episode ${esc(e.number)}:</span>`+(r.links.map(l=>dlBtn(l.label,l.url)).join('')||'<span class="meta">No links right now.</span>');
+    $('#eq').scrollIntoView({behavior:'smooth',block:'nearest'})}catch(x){alert(x.message)}b.disabled=false}
 async function openMovie(id){
   show('<p class="empty">Loading…</p>');
   try{
-    const m=await api('/movies/'+id),x=m.extra||{};
+    const m=await api('/movies/'+id),meta=(k,l)=>m[k]?`<p class="meta"><b>${l}:</b> ${esc(m[k])}</p>`:'';
     show(`<div class="det"><img src="${esc(m.poster)}" alt=""><div class="in"><h3>${esc(m.title)}</h3>
-    <div class="meta">${esc(m.year)}${m.runtime?' · '+m.runtime+' min':''} · <span class="star">★</span> ${m.rating||'–'}${x.imdb&&x.imdb!=='N/A'?' · IMDb '+esc(x.imdb):''}${x.rated&&x.rated!=='N/A'?' · '+esc(x.rated):''}</div>
-    <div class="tags">${(m.genres||[]).map(g=>`<span>${esc(g)}</span>`).join('')}</div>
-    <p style="margin:8px 0">${esc(m.overview)}</p>
-    ${m.cast?.length?`<p class="meta"><b>Cast:</b> ${m.cast.map(esc).join(', ')}</p>`:''}
-    ${x.director&&x.director!=='N/A'?`<p class="meta"><b>Director:</b> ${esc(x.director)}</p>`:''}
-    ${x.awards&&x.awards!=='N/A'?`<p class="meta"><b>Awards:</b> ${esc(x.awards)}</p>`:''}
-    <div class="dl">${m.trailer?`<a class="btn alt" target="_blank" rel="noopener" href="${esc(m.trailer)}">Trailer</a>`:''}
-    ${(m.downloads||[]).map(d=>`<a class="btn" target="_blank" rel="noopener" href="${esc(d.url)}">Download ${esc(d.label)}</a>`).join('')||'<span class="meta">Download links coming soon.</span>'}</div></div></div>`);
+    <div class="meta">${[m.year,m.runtime,m.type==='tv'?'TV series':'Movie',m.rating?'★ '+m.rating:''].filter(Boolean).map(esc).join(' · ')}</div>
+    <p style="margin:8px 0">${esc(m.overview)}</p>${m.cast?.length?`<p class="meta"><b>Cast:</b> ${m.cast.map(esc).join(', ')}</p>`:''}${meta('director','Director')}${meta('country','Country')}
+    ${m.type==='tv'?tvHtml(m):`<div class="dl">${(m.downloads||[]).map(d=>dlBtn(d.label,d.url)).join('')||'<span class="meta">Download links coming soon.</span>'}</div>`}</div></div>`);
+    if(m.type==='tv'&&$('#ss'))eps();
   }catch(e){show(`<p class="empty">${esc(e.message)}</p>`)}
 }
 // ---------- admin ----------
@@ -121,32 +131,22 @@ async function panel(msg=''){
   <div style="display:flex;gap:8px"><input id="as" placeholder="Search by title" style="margin:0"><button class="btn" id="ab">Search</button></div>
   <div id="ar"></div>
   <h2 style="margin-top:20px">On the site (${list.length})</h2>
-  ${list.map(m=>`<div class="row"><img src="${esc(m.poster)}" alt=""><div class="t"><b>${esc(m.title)}</b> <span class="meta">${esc(m.year)} · ${m.downloads.length} links</span></div>
+  ${list.map(m=>`<div class="row"><img src="${esc(m.poster)}" alt=""><div class="t"><b>${esc(m.title)}</b> <span class="meta">${m.type==='tv'?'TV · '+m.episodes.length+' eps':m.downloads.length+' links'}</span></div>
   <button class="btn alt sm" onclick="feat('${m._id}',${!m.featured})">${m.featured?'★ Featured':'☆ Feature'}</button>
-  <button class="btn alt sm" onclick="editLinks('${m._id}')">Links</button>
+  <button class="btn alt sm" onclick="refresh('${m._id}')">Refresh</button>
   <button class="btn alt sm" onclick="del('${m._id}')">Delete</button></div><div id="e${m._id}"></div>`).join('')||'<p class="empty">Nothing added yet.</p>'}</div>`);
   const s=async()=>{
     $('#ar').innerHTML='<p class="meta">Searching…</p>';
     try{const r=await api('/admin/search?q='+encodeURIComponent($('#as').value));
-      $('#ar').innerHTML=r.map(x=>`<div class="row"><img src="${esc(x.poster)}" alt=""><div class="t">${esc(x.title)} <span class="meta">${esc(x.year)}</span></div><button class="btn sm" onclick="add(${x.id},this)">Add</button></div>`).join('')||'<p class="meta">No results.</p>'}
+      $('#ar').innerHTML=r.map(x=>`<div class="row">${x.poster?`<img src="${esc(x.poster)}" alt="">`:''}<div class="t">${esc(x.title)} <span class="meta">${x.type==='tv'?'TV series':'Movie'}</span></div><button class="btn sm" data-l="${esc(x.link)}" onclick="add(this)">Add</button></div>`).join('')||'<p class="meta">No results.</p>'}
     catch(e){$('#ar').innerHTML=`<p class="err">${esc(e.message)}</p>`}
   };
   $('#ab').onclick=s;$('#as').onkeydown=e=>{if(e.key==='Enter')s()};
 }
-async function add(id,b){b.disabled=true;b.textContent='Adding…';try{const m=await api('/admin/import',{method:'POST',body:{tmdbId:id}});await panel(`Added "${m.title}" with ${m.downloads.length} download links.`);load()}catch(e){b.textContent='Failed';alert(e.message)}}
+async function add(b){b.disabled=true;b.textContent='Adding…';try{const m=await api('/admin/import',{method:'POST',body:{link:b.dataset.l}});await panel(`Added "${m.title}".`);load()}catch(e){b.disabled=false;b.textContent='Add';alert(e.message)}}
 async function feat(id,v){await api('/admin/movies/'+id,{method:'PUT',body:{featured:v}});panel();load()}
 async function del(id){if(!confirm('Delete this movie?'))return;await api('/admin/movies/'+id,{method:'DELETE'});panel('Movie deleted.');load()}
-async function editLinks(id){
-  const el=$('#e'+id);if(el.innerHTML){el.innerHTML='';return}
-  const m=(await api('/admin/movies')).find(x=>x._id===id);
-  el.innerHTML=`<textarea id="t${id}" rows="4" placeholder="One per line: label | url">${esc(m.downloads.map(d=>d.label+' | '+d.url).join('\n'))}</textarea>
-  <button class="btn sm" onclick="saveLinks('${id}')">Save links</button> <button class="btn alt sm" onclick="refetch('${id}')">Fetch from API</button>`;
-}
-async function saveLinks(id){
-  const downloads=$('#t'+id).value.split('\n').map(l=>l.split('|').map(s=>s.trim())).filter(p=>p[1]||/^https?:/.test(p[0])).map(p=>p[1]?{label:p[0],url:p[1]}:{label:'Download',url:p[0]});
-  await api('/admin/movies/'+id,{method:'PUT',body:{downloads}});panel('Links saved.');
-}
-async function refetch(id){try{const m=await api(`/admin/movies/${id}/links`,{method:'POST'});panel(`Fetched ${m.downloads.length} links.`)}catch(e){alert(e.message)}}
+async function refresh(id){try{const m=await api('/admin/movies/'+id+'/refresh',{method:'POST'});panel(`Refreshed "${m.title}".`);load()}catch(e){alert(e.message)}}
 function logout(){token='';try{localStorage.removeItem('sm_t')}catch{}hide()}
 load();
 </script></body></html>

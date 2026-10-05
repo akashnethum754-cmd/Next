@@ -113,8 +113,15 @@ app.post('/api/login', (req, res) => {
   res.status(401).json({ error: 'Wrong username or password' });
 });
 app.get('/api/admin/search', auth, wrap(async (req, res) => {
-  const d = await ch('/search', { q: req.query.q || '' });
-  res.json(d.slice(0, 25).map(x => ({ title: x.title, link: x.link, type: x.type === 'tvshows' || isTv(x.link) ? 'tv' : 'movie', poster: x.image || '' })));
+  const q = req.query.q || '', seen = new Set(), out = [];
+  const push = arr => arr.forEach(x => {
+    if (x.link && !seen.has(x.link)) { seen.add(x.link); out.push({ title: x.title, link: x.link, type: x.type === 'tvshows' || isTv(x.link) ? 'tv' : 'movie', poster: x.image || x.poster || x.thumbnail || '' }); }
+  });
+  let err;
+  try { push(await ch('/search', { q })); } catch (e) { err = e; console.error('chamindu search:', e.message); }
+  if (!out.length) { try { push((await cine('/cinesubz/search', { query: q })).results || []); } catch (e) { console.error('laksidu search:', e.message); err = err || e; } }
+  if (!out.length && err) throw err;
+  res.json(out.slice(0, 25));
 }));
 app.get('/api/admin/movies', auth, wrap(async (req, res) => res.json(await Movie.find().sort({ createdAt: -1 }))));
 app.post('/api/admin/import', auth, wrap(async (req, res) => {

@@ -134,21 +134,26 @@ async function epq(s,i,b){const e=S[s][i];b.disabled=true;
   try{const r=await api('/episode?url='+encodeURIComponent(e.url));
     $('#eq').innerHTML=`<span class="meta" style="width:100%">Episode ${esc(e.number)}:</span>`+(r.links.map(l=>dlBtn(l.label,l.url)).join('')||'<span class="meta">No links right now.</span>');
     $('#eq').scrollIntoView({behavior:'smooth',block:'nearest'})}catch(x){alert(x.message)}b.disabled=false}
-async function loadLinks(id){
-  const el=$('#dls');
+async function loadLinks(id,quiet){
+  const el=$('#dls');if(!el)return;
   try{const r=await api('/links/'+id),G={};
     r.links.forEach(l=>{const k=(l.label.match(/\d{3,4}p/)||['Other'])[0];(G[k]=G[k]||{size:l.size,items:[]}).items.push(l)});
-    el.innerHTML=Object.keys(G).map(k=>`<div style="width:100%"><div class="meta"><b>${esc(k)}</b>${G[k].size?' · '+esc(G[k].size):''}</div><div class="dl" style="margin:4px 0 8px;border:0;padding:0">${G[k].items.map(l=>`<a class="btn sm" target="_blank" rel="noopener" href="${esc(l.url)}">${esc((l.label.match(/\[(.*?)\]/)||[0,'Download'])[1])}</a>`).join('')}</div></div>`).join('')||'<span class="meta">No links right now.</span>'
-  }catch(e){el.innerHTML=`<span class="meta">${esc(e.message)}</span>`}
+    el.innerHTML=Object.keys(G).map(k=>`<div style="width:100%"><div class="meta"><b>${esc(k)}</b>${G[k].size?' · '+esc(G[k].size):''}</div><div class="dl" style="margin:4px 0 8px;border:0;padding:0">${G[k].items.map(l=>`<a class="btn sm" target="_blank" rel="noopener" href="${esc(l.url)}">${esc((l.label.match(/\[(.*?)\]/)||[0,'Download'])[1])}</a>`).join('')}</div></div>`).join('')||'<span class="meta">No links right now.</span>';
+    if(r.stale&&!quiet)setTimeout(()=>loadLinks(id,true),10000);
+  }catch(e){if(!quiet)el.innerHTML=`<span class="meta">${esc(e.message)}. Close and open again to retry.</span>`}
 }
+let OV={};
+function rm(b){const f=b.dataset.f==='1';$('#ov').textContent=f?OV.short:OV.full;b.dataset.f=f?'0':'1';b.textContent=f?'Read more':'Show less'}
 async function openMovie(id){
   show('<p class="empty">Loading…</p>');
   try{
     const m=await api('/movies/'+id),meta=(k,l)=>m[k]?`<p class="meta"><b>${l}:</b> ${esc(m[k])}</p>`:'';
+    m.country=[...new Set(String(m.country||'').split(',').map(x=>x.trim()).filter(Boolean))].join(', ');
+    const ov=(m.overview||'').trim(),short=ov.length>230?ov.slice(0,230).replace(/\s+\S*$/,'')+'…':ov;OV={full:ov,short};
     show(`<div class="det"><img src="${esc(m.poster)}" alt=""><div class="in"><h3>${esc(ct(m.title))}</h3>
     <div class="meta">${[m.year,m.runtime,m.type==='tv'?'TV series':'Movie',m.rating?'★ '+m.rating:''].filter(Boolean).map(esc).join(' · ')}</div>
-    <div class="tags">${(m.genres||[]).map(g=>`<span>${esc(g)}</span>`).join('')}</div><p style="margin:8px 0">${esc(m.overview)}</p>${m.cast?.length?`<p class="meta"><b>Cast:</b> ${m.cast.map(esc).join(', ')}</p>`:''}${meta('director','Director')}${meta('country','Country')}
-    ${m.type==='tv'?tvHtml(m):'<div class="dl" id="dls"><span class="meta">Loading links…</span></div>'}</div></div>`);
+    <div class="tags">${(m.genres||[]).filter(g=>!/^[#.]/.test(g)).map(g=>`<span>${esc(g)}</span>`).join('')}</div><p style="margin:8px 0" id="ov">${esc(short)}</p>${ov.length>230?'<button class="btn alt sm" data-f="0" onclick="rm(this)" style="margin-bottom:8px">Read more</button>':''}${m.cast?.length?`<p class="meta"><b>Cast:</b> ${m.cast.map(esc).join(', ')}</p>`:''}${meta('director','Director')}${meta('country','Country')}
+    ${m.type==='tv'?tvHtml(m):'<div class="dl" id="dls"><span class="meta">Getting download links… the first time can take a few seconds.</span></div>'}</div></div>`);
     if(m.type==='tv'&&$('#ss'))eps();
     if(m.type!=='tv')loadLinks(id);
   }catch(e){show(`<p class="empty">${esc(e.message)}</p>`)}

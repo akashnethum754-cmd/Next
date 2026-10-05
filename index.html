@@ -47,6 +47,15 @@ h2{font:700 20px Oswald;margin-bottom:12px}
 .row img{width:40px;border-radius:4px}.row .t{flex:1;min-width:0}
 .err{color:#ff6b78;font-size:13px;margin-bottom:8px}
 .empty{color:var(--mute);padding:30px 0;text-align:center}
+.tabs{display:flex;gap:6px;margin:14px 0;overflow-x:auto}
+.tabs button{flex:1;white-space:nowrap;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px 10px;cursor:pointer}
+.tabs .on{background:var(--red);border-color:var(--red);font-weight:700}
+.item{display:flex;gap:12px;padding:10px 0;border-bottom:1px solid var(--line);align-items:center}
+.item img,.ph{width:52px;height:76px;object-fit:cover;border-radius:6px;flex:none;background:#1d1524}
+.info{flex:1;min-width:0}
+.nm{font-weight:700;line-height:1.25;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.acts{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
+.note{background:#1d1524;border-left:3px solid var(--purple);padding:8px 12px;border-radius:6px;font-size:13px;margin-bottom:10px}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 </style></head><body>
 <header>
@@ -67,14 +76,14 @@ async function api(p,o={}){
   const r=await fetch('/api'+p,{...o,headers:{'Content-Type':'application/json',...(token?{Authorization:'Bearer '+token}:{})},body:o.body?JSON.stringify(o.body):undefined});
   const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||'Something went wrong');return j;
 }
-const card=m=>`<div class="card" tabindex="0" onclick="openMovie('${m._id}')" onkeydown="if(event.key==='Enter')openMovie('${m._id}')"><img loading="lazy" src="${esc(m.poster)}" alt="${esc(m.title)}"><b>${esc(m.title)}</b><span>${esc(m.year)} <i class="star">★</i> ${m.rating||'–'}</span></div>`;
+const card=m=>`<div class="card" tabindex="0" onclick="openMovie('${m._id}')" onkeydown="if(event.key==='Enter')openMovie('${m._id}')"><img loading="lazy" src="${esc(m.poster)}" alt="${esc(ct(m.title))}"><b>${esc(ct(m.title))}</b><span>${esc(m.year)} <i class="star">★</i> ${m.rating||'–'}</span></div>`;
 async function load(reset=true){
   if(reset){page=1;$('#grid').innerHTML=''}
   try{
     const d=await api(`/movies?q=${encodeURIComponent(query)}&page=${page}`);pages=d.pages;
     if(reset){
       const h=d.items.find(x=>x.backdrop);
-      $('#hero').innerHTML=!query&&h?`<div class="hero" style="background-image:url('${esc(h.backdrop)}')"><div><h1>${esc(h.title)}</h1><p>${esc(h.overview)}</p><button class="btn" onclick="openMovie('${h._id}')">Watch & download</button></div></div>`:'';
+      $('#hero').innerHTML=!query&&h?`<div class="hero" style="background-image:url('${esc(h.backdrop)}')"><div><h1>${esc(ct(h.title))}</h1><p>${esc(h.overview)}</p><button class="btn" onclick="openMovie('${h._id}')">Watch & download</button></div></div>`:'';
       $('#ttl').textContent=query?`Results for "${query}"`:'Latest movies';
       if(!d.items.length)$('#grid').innerHTML='<p class="empty" style="grid-column:1/-1">No movies yet. Add some from the admin panel.</p>';
     }
@@ -113,7 +122,7 @@ async function openMovie(id){
   show('<p class="empty">Loading…</p>');
   try{
     const m=await api('/movies/'+id),meta=(k,l)=>m[k]?`<p class="meta"><b>${l}:</b> ${esc(m[k])}</p>`:'';
-    show(`<div class="det"><img src="${esc(m.poster)}" alt=""><div class="in"><h3>${esc(m.title)}</h3>
+    show(`<div class="det"><img src="${esc(m.poster)}" alt=""><div class="in"><h3>${esc(ct(m.title))}</h3>
     <div class="meta">${[m.year,m.runtime,m.type==='tv'?'TV series':'Movie',m.rating?'★ '+m.rating:''].filter(Boolean).map(esc).join(' · ')}</div>
     <div class="tags">${(m.genres||[]).map(g=>`<span>${esc(g)}</span>`).join('')}</div><p style="margin:8px 0">${esc(m.overview)}</p>${m.cast?.length?`<p class="meta"><b>Cast:</b> ${m.cast.map(esc).join(', ')}</p>`:''}${meta('director','Director')}${meta('country','Country')}
     ${m.type==='tv'?tvHtml(m):`<div class="dl" id="dls"><span class="meta">Loading links…</span></div>`}</div></div>`);
@@ -130,28 +139,48 @@ function loginView(err=''){
   const go=async()=>{try{const r=await api('/login',{method:'POST',body:{user:$('#lu').value,pass:$('#lp').value}});token=r.token;try{localStorage.setItem('sm_t',token)}catch{}panel()}catch(e){loginView(e.message)}};
   $('#lb').onclick=go;$('#lp').onkeydown=e=>{if(e.key==='Enter')go()};
 }
+let tab='add',flt='',A=[];
+function ct(t){return String(t||'').replace(/\s*Sinhala Subtitles.*$/i,'').replace(/\s*\|.*$/,'').trim()}
 async function panel(msg=''){
-  let list=[];
-  try{list=await api('/admin/movies')}catch(e){token='';try{localStorage.removeItem('sm_t')}catch{}return loginView('Session ended. Log in again.')}
-  show(`<div class="pad"><div class="row" style="border:0"><h2 style="flex:1;margin:0">Admin panel</h2><button class="btn alt sm" onclick="logout()">Log out</button></div>
-  ${msg?`<p class="meta">${esc(msg)}</p>`:''}
-  <h2 style="margin-top:14px">Add a movie</h2>
-  <div style="display:flex;gap:8px"><input id="as" placeholder="Search by title" style="margin:0"><button class="btn" id="ab">Search</button></div>
-  <div id="ar"></div>
-  <h2 style="margin-top:20px">On the site (${list.length})</h2>
-  ${list.map(m=>`<div class="row"><img src="${esc(m.poster)}" alt=""><div class="t"><b>${esc(m.title)}</b> <span class="meta">${m.type==='tv'?'TV · '+m.episodes.length+' eps':'Movie'}</span></div>
-  <button class="btn alt sm" onclick="feat('${m._id}',${!m.featured})">${m.featured?'★ Featured':'☆ Feature'}</button>
-  <button class="btn alt sm" onclick="refresh('${m._id}')">Refresh</button>
-  <button class="btn alt sm" onclick="del('${m._id}')">Delete</button></div><div id="e${m._id}"></div>`).join('')||'<p class="empty">Nothing added yet.</p>'}</div>`);
+  try{A=await api('/admin/movies')}catch(e){token='';try{localStorage.removeItem('sm_t')}catch{}return loginView('Session ended. Log in again.')}
+  draw(msg);
+}
+function draw(msg=''){
+  show(`<div class="pad"><div class="row" style="border:0;padding-right:44px"><h2 style="flex:1;margin:0">Admin panel</h2><button class="btn alt sm" onclick="logout()">Log out</button></div>
+  <div class="tabs" id="tabs"></div>${msg?`<p class="note">${esc(msg)}</p>`:''}<div id="tb"></div></div>`);
+  drawTabs();tab==='add'?addTab():listTab();
+}
+function drawTabs(){
+  const c=f=>A.filter(f).length,T=[['add','＋ Add'],['movie','Movies '+c(m=>m.type!=='tv')],['tv','TV '+c(m=>m.type==='tv')],['feat','★ '+c(m=>m.featured)]];
+  $('#tabs').innerHTML=T.map(([k,l])=>`<button class="${tab===k?'on':''}" onclick="tab='${k}';flt='';draw()">${l}</button>`).join('');
+}
+const poster=u=>u?`<img src="${esc(u)}" alt="" loading="lazy">`:'<div class="ph"></div>';
+function addTab(){
+  $('#tb').innerHTML='<div style="display:flex;gap:8px"><input id="as" placeholder="Search movie or series" style="margin:0"><button class="btn" id="ab">Search</button></div><div id="ar"></div>';
   const s=async()=>{
-    $('#ar').innerHTML='<p class="meta">Searching…</p>';
-    try{const r=await api('/admin/search?q='+encodeURIComponent($('#as').value));
-      $('#ar').innerHTML=r.map(x=>`<div class="row">${x.poster?`<img src="${esc(x.poster)}" alt="">`:''}<div class="t">${esc(x.title)} <span class="meta">${x.type==='tv'?'TV series':'Movie'}</span></div><button class="btn sm" data-l="${esc(x.link)}" onclick="add(this)">Add</button></div>`).join('')||'<p class="meta">No results.</p>'}
-    catch(e){$('#ar').innerHTML=`<p class="err">${esc(e.message)}</p>`}
+    const q=$('#as').value.trim();if(!q)return;
+    $('#ar').innerHTML='<p class="meta" style="margin-top:10px">Searching…</p>';
+    try{
+      const r=await api('/admin/search?q='+encodeURIComponent(q)),have=new Set(A.map(m=>m.sourceUrl));
+      $('#ar').innerHTML=r.map(x=>`<div class="item">${poster(x.poster)}<div class="info"><div class="nm">${esc(ct(x.title))}</div><div class="meta">${x.type==='tv'?'TV series':'Movie'}</div></div>${have.has(x.link)?'<span class="meta">Added ✓</span>':`<button class="btn sm" data-l="${esc(x.link)}" onclick="add(this)">Add</button>`}</div>`).join('')||'<p class="meta" style="margin-top:10px">No results. Try another spelling or fewer words (for example "salaar").</p>';
+    }catch(e){$('#ar').innerHTML=`<p class="err" style="margin-top:10px">${esc(e.message)}</p>`}
   };
   $('#ab').onclick=s;$('#as').onkeydown=e=>{if(e.key==='Enter')s()};
 }
-async function add(b){b.disabled=true;b.textContent='Adding…';try{const m=await api('/admin/import',{method:'POST',body:{link:b.dataset.l}});await panel(`Added "${m.title}".`);load()}catch(e){b.disabled=false;b.textContent='Add';alert(e.message)}}
+function listTab(){
+  const L=A.filter(m=>tab==='tv'?m.type==='tv':tab==='feat'?m.featured:m.type!=='tv');
+  $('#tb').innerHTML=`<input id="fl" placeholder="Filter this list" value="${esc(flt)}">`+'<div id="li"></div>';
+  const r=()=>{const v=flt.toLowerCase();
+    $('#li').innerHTML=L.filter(m=>m.title.toLowerCase().includes(v)).map(m=>`<div class="item">${poster(m.poster)}<div class="info"><div class="nm">${esc(ct(m.title))}</div>
+    <div class="meta">${esc(m.year||'')}${m.type==='tv'?' · '+m.episodes.length+' episodes':''}</div>
+    <div class="acts"><button class="btn alt sm" onclick="feat('${m._id}',${!m.featured})">${m.featured?'★ Featured':'☆ Feature'}</button><button class="btn alt sm" onclick="refresh('${m._id}')">Refresh</button><button class="btn alt sm" onclick="del('${m._id}')">Delete</button></div></div></div>`).join('')||'<p class="empty">Nothing here yet.</p>'};
+  r();$('#fl').oninput=e=>{flt=e.target.value;r()};
+}
+async function add(b){
+  b.disabled=true;b.textContent='Adding…';
+  try{const m=await api('/admin/import',{method:'POST',body:{link:b.dataset.l}});A.unshift(m);b.outerHTML='<span class="meta">Added ✓</span>';drawTabs();load()}
+  catch(e){b.disabled=false;b.textContent='Add';alert(e.message)}
+}
 async function feat(id,v){await api('/admin/movies/'+id,{method:'PUT',body:{featured:v}});panel();load()}
 async function del(id){if(!confirm('Delete this movie?'))return;await api('/admin/movies/'+id,{method:'DELETE'});panel('Movie deleted.');load()}
 async function refresh(id){try{const m=await api('/admin/movies/'+id+'/refresh',{method:'POST'});panel(`Refreshed "${m.title}".`);load()}catch(e){alert(e.message)}}

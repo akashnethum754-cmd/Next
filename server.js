@@ -148,17 +148,17 @@ const say = (chat, text, kb) => tg('sendMessage', { chat_id: chat, text, parse_m
 const show = (c, text, kb) => c.mid ? tg('editMessageText', { chat_id: c.chat, message_id: c.mid, text, parse_mode: 'HTML', reply_markup: { inline_keyboard: kb || [] } }) : say(c.chat, text, kb);
 const BACK = [{ text: '« Menu', callback_data: 'menu' }];
 const MENU = [[{ text: '🔍 Search & add', callback_data: 's' }], [{ text: '🎬 Movies', callback_data: 'l:movie:0' }, { text: '📺 TV series', callback_data: 'l:tv:0' }], [{ text: '⭐ Featured', callback_data: 'l:feat:0' }, { text: '📊 Stats', callback_data: 'st' }], [{ text: '🔒 Log out', callback_data: 'out' }]];
-const HOME = '🎬 <b>SHAGGY MOVIES admin</b>\nSend a movie or series name to search and add it.';
+const HOME = '🎬 <b>SHAGGY MOVIES admin</b>\nSend a movie or series name to search and add it.\n\n<b>Commands</b>\n/bulk word : add every result of a search\n/bulkall : add as many movies as possible\n/links : save download links for all movies\n/stop : stop a running job';
 const q4 = t => t === 'tv' ? { type: 'tv' } : t === 'feat' ? { featured: true } : { type: { $ne: 'tv' } };
 
-async function searchAll(q) {
+async function searchAll(q, page = 1) {
   const seen = new Set(), out = []; let err;
   const push = arr => arr.forEach(x => {
     if (x.link && !seen.has(x.link)) { seen.add(x.link); out.push({ title: x.title, link: x.link, type: x.type === 'tvshows' || isTv(x.link) ? 'tv' : 'movie' }); }
   });
-  try { push(await ch('/search', { q })); } catch (e) { err = e; console.error('chamindu search:', e.message); }
-  if (!out.length) { try { push((await cine('/cinesubz/search', { query: q })).results || []); } catch (e) { err = err || e; console.error('laksidu search:', e.message); } }
-  if (!out.length && err) throw err;
+  try { push(await ch('/search', page > 1 ? { q, page } : { q })); } catch (e) { err = e; console.error('chamindu search:', e.message); }
+  if (!out.length && page === 1) { try { push((await cine('/cinesubz/search', { query: q })).results || []); } catch (e) { err = err || e; console.error('laksidu search:', e.message); } }
+  if (!out.length && err && page === 1) throw err;
   return out;
 }
 async function doSearch(chat, s, q) {
@@ -188,6 +188,7 @@ async function listView(c, t, p) {
 async function act(c, s, d) {
   const [k, a, b] = d.split(':');
   if (k === 'menu') return show(c, HOME, MENU);
+  if (k === 'stop') { JOB.stop = true; return show(c, '🛑 Stopping after the current step…'); }
   if (k === 's') return show(c, '🔍 Send the movie or series name.', [BACK]);
   if (k === 'st') {
     const [m, t, f] = await Promise.all([Movie.countDocuments({ type: { $ne: 'tv' } }), Movie.countDocuments({ type: 'tv' }), Movie.countDocuments({ featured: true })]);
@@ -210,6 +211,54 @@ async function act(c, s, d) {
     return show(c, `✅ Added: <b>${H(clean(doc.title))}</b>`, [[{ text: '📋 Back to results', callback_data: 'rs' }], [{ text: '🔍 New search', callback_data: 's' }, ...BACK]]);
   }
 }
+const JOB = { run: false, stop: false };
+const STOPKB = [[{ text: '🛑 Stop', callback_data: 'stop' }]];
+const ALLKW = [...Array.from({ length: 47 }, (_, i) => String(2026 - i)), ...'abcdefghijklmnopqrstuvwxyz0123456789'.split(''),
+  'action', 'comedy', 'horror', 'thriller', 'drama', 'romance', 'animation', 'crime', 'war', 'adventure', 'fantasy', 'family', 'mystery', 'korean', 'hindi', 'tamil', 'anime', 'sinhala', 'complete'];
+
+// save download links for every movie that has none yet
+async function backfill(chat) {
+  if (JOB.run) return chat && say(chat, '⏳ Another job is running. Send /stop to cancel it.');
+  JOB.run = true; JOB.stop = false;
+  let ok = 0, bad = 0;
+  try {
+    const list = await Movie.find({ type: { $ne: 'tv' }, 'downloads.0': { $exists: false } }, 'sourceUrl');
+    if (!list.length) return chat && say(chat, '✅ Every movie already has saved download links.');
+    const w = chat && await say(chat, `🔗 Saving links for ${list.length} movies…`, STOPKB), c = { chat, mid: w?.result?.message_id };
+    let last = 0;
+    for (let i = 0; i < list.length && !JOB.stop; i += 3) {
+      const r = await Promise.allSettled(list.slice(i, i + 3).map(m => freshLinks(m)));
+      r.forEach(x => x.status === 'fulfilled' && x.value.length ? ok++ : bad++);
+      if (chat && Date.now() - last > 4000) { last = Date.now(); show(c, `🔗 Saving links… ${ok + bad}/${list.length}\n✅ ${ok}   ⚠️ ${bad}`, STOPKB); }
+    }
+    if (chat) say(chat, `✅ Links finished${JOB.stop ? ' (stopped)' : ''}\nSaved: ${ok}\nNo links found: ${bad}`);
+  } finally { JOB.run = false; }
+}
+// add many titles from cinesubz by running many searches (3 at a time)
+async function bulk(chat, keywords) {
+  if (JOB.run) return say(chat, '⏳ Another job is running. Send /stop to cancel it.');
+  JOB.run = true; JOB.stop = false;
+  const w = await say(chat, '📥 Bulk add started…', STOPKB), c = { chat, mid: w.result?.message_id };
+  const seen = new Set(); let added = 0, bad = 0, last = 0, done = 0;
+  const tick = () => { if (Date.now() - last > 4000) { last = Date.now(); show(c, `📥 Bulk adding…\n🔎 Searches: ${done}/${keywords.length}\n✅ Added: ${added}\n⚠️ Failed: ${bad}`, STOPKB); } };
+  try {
+    for (const kw of keywords) {
+      for (let p = 1; p <= 5 && !JOB.stop; p++) {
+        let res; try { res = await searchAll(kw, p); } catch { break; }
+        const fresh = res.filter(x => !seen.has(x.link)); fresh.forEach(x => seen.add(x.link));
+        if (!fresh.length) break;
+        const have = new Set((await Movie.find({ sourceUrl: { $in: fresh.map(x => x.link) } }, 'sourceUrl')).map(x => x.sourceUrl));
+        const todo = fresh.filter(x => !have.has(x.link));
+        for (let i = 0; i < todo.length && !JOB.stop; i += 3) {
+          const r = await Promise.allSettled(todo.slice(i, i + 3).map(async x => { const doc = await build(x.link); await Movie.findOneAndUpdate({ sourceUrl: doc.sourceUrl }, doc, { upsert: true }); }));
+          r.forEach(x => x.status === 'fulfilled' ? added++ : bad++); tick();
+        }
+      }
+      done++; tick(); if (JOB.stop) break;
+    }
+  } finally { JOB.run = false; }
+  say(chat, `✅ Bulk finished${JOB.stop ? ' (stopped)' : ''}\nAdded: ${added}\nFailed: ${bad}`);
+}
 async function handle(u) {
   const cb = u.callback_query, msg = u.message, from = (cb || msg)?.from; if (!from) return;
   const chat = cb ? cb.message.chat.id : msg.chat.id, text = (msg?.text || '').trim();
@@ -230,12 +279,17 @@ async function handle(u) {
   }
   s.until = now + 30 * 60e3;
   if (cb) { tg('answerCallbackQuery', { callback_query_id: cb.id }); return act({ chat, mid: cb.message.message_id }, s, cb.data).catch(e => say(chat, '⚠️ ' + H(e.message))); }
+  if (/^\/stop\b/.test(text)) { JOB.stop = true; return say(chat, '🛑 Stopping after the current step…'); }
+  if (/^\/links\b/.test(text)) return backfill(chat).catch(e => say(chat, '⚠️ ' + H(e.message)));
+  if (/^\/bulkall\b/.test(text)) return bulk(chat, ALLKW).catch(e => say(chat, '⚠️ ' + H(e.message)));
+  if (/^\/bulk\b/.test(text)) { const w = text.replace(/^\/bulk\s*/, '').trim(); return w ? bulk(chat, [w]).catch(e => say(chat, '⚠️ ' + H(e.message))) : say(chat, 'Use: <code>/bulk avatar</code>'); }
   if (/^\/(start|menu)\b/.test(text)) return act({ chat }, s, 'menu');
   if (text && !text.startsWith('/')) return doSearch(chat, s, text).catch(e => say(chat, '⚠️ ' + H(e.message)));
 }
 async function poll() {
   if (!E.TG_BOT_TOKEN) return console.log('Telegram bot off (no TG_BOT_TOKEN)');
-  await tg('deleteWebhook'); console.log('Telegram bot running'); let off = 0;
+  await tg('deleteWebhook');
+  tg('setMyCommands', { commands: [{ command: 'menu', description: 'Open menu' }, { command: 'login', description: 'Unlock with PIN' }, { command: 'bulk', description: 'Add all results of a search' }, { command: 'bulkall', description: 'Add as many movies as possible' }, { command: 'links', description: 'Save links for all movies' }, { command: 'stop', description: 'Stop running job' }] }); console.log('Telegram bot running'); let off = 0;
   for (;;) {
     const r = await tg('getUpdates', { offset: off, timeout: 30, allowed_updates: ['message', 'callback_query'] });
     if (!r.ok) { await new Promise(x => setTimeout(x, 5000)); continue; }
@@ -243,3 +297,4 @@ async function poll() {
   }
 }
 poll();
+setTimeout(() => backfill().catch(e => console.error('backfill:', e.message)), 20000); // quietly save links for older movies after start

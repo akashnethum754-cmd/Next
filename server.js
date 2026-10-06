@@ -13,22 +13,6 @@ const Movie = mongoose.model('Movie', new mongoose.Schema({
   episodes: [{ season: Number, number: String, title: String, url: String }]
 }, { timestamps: true }));
 
-const Poster = mongoose.model('Poster', new mongoose.Schema({ movie: { type: mongoose.Schema.Types.ObjectId, unique: true }, type: String, data: Buffer }));
-// posters are copied into MongoDB once, then served from our own site (fast + cached by the browser)
-async function getPoster(id) {
-  const old = await Poster.findOne({ movie: id }); if (old) return old;
-  const m = await Movie.findById(id, 'poster'); if (!m?.poster) return null;
-  const r = await fetch(m.poster, { signal: AbortSignal.timeout(15000), headers: { 'User-Agent': 'Mozilla/5.0' } });
-  if (!r.ok) return null;
-  const data = Buffer.from(await r.arrayBuffer()); if (data.length > 4e6) return null;
-  return Poster.findOneAndUpdate({ movie: m._id }, { type: r.headers.get('content-type') || 'image/jpeg', data }, { upsert: true, new: true });
-}
-async function warmPosters() {
-  const have = new Set((await Poster.find({}, 'movie')).map(x => String(x.movie)));
-  const ids = (await Movie.find({}, '_id')).map(x => String(x._id)).filter(i => !have.has(i));
-  for (let i = 0; i < ids.length; i += 3) await Promise.allSettled(ids.slice(i, i + 3).map(getPoster));
-}
-
 // ---- cinesubz API (key stays on the server) ----
 const BASE = E.CINE_API_URL || 'https://apis.laksidu.site';
 async function cine(p, params, tries = 2) {
@@ -60,28 +44,13 @@ async function infodl(link) {
   const c = linkCache.get(link); if (c && Date.now() - c.t < 6e5) return c.d;
   const d = await ch('/infodl', { q: link }); linkCache.set(link, { t: Date.now(), d }); return d;
 }
-// cinesubz.* pages and Telegram links are not real downloads, so they are never shown
-const bad = u => { try { return /(^|\.)(cinesubz\.[a-z]+|t\.me|telegram\.me)$/i.test(new URL(u).hostname); } catch { return true; } };
-async function laksiduLinks(link) { // fallback: resolve every quality through the bot's download API
-  try {
-    const det = (await cine('/cinesubz/details', { url: link })).data;
-    const qs = (det.downloads || []).filter(x => x && x.quality && x.url).slice(0, 6), out = [];
-    for (let i = 0; i < qs.length; i += 3) await Promise.allSettled(qs.slice(i, i + 3).map(async q => {
-      const d = (await cine('/dl/cinesubz', { url: q.url }, 2)).data;
-      (d?.download || []).filter(l => l.name && l.name.toLowerCase() !== 'telegram' && l.url && !bad(l.url)).slice(0, 3)
-        .forEach(l => out.push({ label: `${q.quality} [${l.name === 'unknown' ? 'Direct' : l.name}]`, size: '', url: l.url }));
-    }));
-    return out;
-  } catch (e) { console.error('laksidu links:', e.message); return []; }
-}
-const toLinks = d => (d.downloads || []).filter(x => x.link && !/telegram/i.test(x.quality) && !bad(x.link)).map(x => ({ label: x.quality, size: x.size, url: x.link }));
+const toLinks = d => (d.downloads || []).filter(x => x.link && !/telegram/i.test(x.quality)).map(x => ({ label: x.quality, size: x.size, url: x.link }));
 const inflight = new Map();
 function freshLinks(m) { // fetch new links, save them in MongoDB (shared by simultaneous requests)
   const k = String(m._id);
   if (!inflight.has(k)) inflight.set(k, (async () => {
     linkCache.delete(m.sourceUrl);
-    let downloads = toLinks(await infodl(m.sourceUrl));
-    if (!downloads.length) downloads = await laksiduLinks(m.sourceUrl);
+    const downloads = toLinks(await infodl(m.sourceUrl));
     await Movie.findByIdAndUpdate(m._id, { downloads, linksAt: new Date() });
     return downloads;
   })().finally(() => inflight.delete(k)));
@@ -98,13 +67,12 @@ async function build(link) {
     return { sourceUrl: link, type: 'tv', title: d.title, year: d.year, poster: d.poster, overview: d.description, rating: d.rating?.score ? String(d.rating.score) : '', episodes };
   }
   const d = await infodl(link);
-  let downloads = toLinks(d); if (!downloads.length) downloads = await laksiduLinks(link);
   return {
     sourceUrl: link, type: 'movie', title: d.title, year: d.year, poster: d.image,
     overview: (d.story || '').split('\n\n')[0].slice(0, 700), rating: d.rating && d.rating !== 'N/A' ? d.rating : '',
     runtime: d.duration, director: d.director, country: [...new Set((d.country || '').split(',').map(x => x.trim()).filter(Boolean))].join(', '),
     cast: (d.cast || []).slice(0, 8).map(c => c.name), genres: (d.genres || []).filter(g => !/^[#.]/.test(g) && !/^(hdcam|cam)$/i.test(g)),
-    downloads, linksAt: new Date()
+    downloads: toLinks(d), linksAt: new Date()
   };
 }
 const allowed = new Set(); // episode links we handed out
@@ -124,7 +92,7 @@ app.get('/api/movies', wrap(async (req, res) => {
   const f = c.length ? { $and: c } : {};
   const [items, total] = await Promise.all([
     Movie.find(f, '-downloads -cast -episodes').sort({ featured: -1, createdAt: -1 }).skip((page - 1) * 24).limit(24), Movie.countDocuments(f)]);
-  res.set('Cache-Control', 'public, max-age=20').json({ items, total, pages: Math.ceil(total / 24) });
+  res.json({ items, total, pages: Math.ceil(total / 24) });
 }));
 app.get('/api/genres', wrap(async (req, res) => res.json((await Movie.distinct('genres')).filter(Boolean).sort())));
 app.get('/api/movies/:id', wrap(async (req, res) => {
@@ -150,19 +118,13 @@ app.get('/api/resolve', wrap(async (req, res) => {
   pick ? res.json({ url: pick.url }) : res.status(404).json({ error: 'No download link available right now' });
 }));
 
-app.get('/img/:id', async (req, res) => {
-  try { const p = await getPoster(req.params.id); if (p) return res.set({ 'Content-Type': p.type, 'Cache-Control': 'public, max-age=31536000, immutable' }).send(p.data); } catch (e) {}
-  const m = await Movie.findById(req.params.id, 'poster').catch(() => null);
-  m?.poster ? res.redirect(m.poster) : res.status(404).end();
-});
 app.get('/api/links/:id', wrap(async (req, res) => {
   const m = await Movie.findById(req.params.id, 'sourceUrl downloads linksAt');
   if (!m) return res.status(404).json({ error: 'Not found' });
-  const good = m.downloads.filter(x => !bad(x.url));
-  if (good.length) { // saved links open instantly; old or cleaned ones refresh in the background
-    const stale = Date.now() - (m.linksAt?.getTime() || 0) > 20 * 60e3 || good.length < m.downloads.length;
+  if (m.downloads.length) { // saved links open instantly; old ones refresh in the background
+    const stale = Date.now() - (m.linksAt?.getTime() || 0) > 20 * 60e3;
     if (stale) freshLinks(m).catch(e => console.error('links refresh:', e.message));
-    return res.json({ stale, links: good.map(x => ({ label: x.label, size: x.size, url: x.url })) });
+    return res.json({ stale, links: m.downloads.map(x => ({ label: x.label, size: x.size, url: x.url })) });
   }
   res.json({ links: await freshLinks(m) });
 }));
@@ -236,16 +198,15 @@ async function act(c, s, d) {
   if (k === 'l') return listView(c, a, +b || 0);
   if (k === 'm') return itemView(c, a);
   if (k === 'f') { const m = await Movie.findById(a); await Movie.findByIdAndUpdate(a, { featured: !m.featured }); return itemView(c, a); }
-  if (k === 'r') { await show(c, '⏳ Refreshing…'); const m = await Movie.findById(a); linkCache.delete(m.sourceUrl); await Poster.deleteOne({ movie: a }); await Movie.findByIdAndUpdate(a, await build(m.sourceUrl)); return itemView(c, a); }
+  if (k === 'r') { await show(c, '⏳ Refreshing…'); const m = await Movie.findById(a); linkCache.delete(m.sourceUrl); await Movie.findByIdAndUpdate(a, await build(m.sourceUrl)); return itemView(c, a); }
   if (k === 'rs') return show(c, `Results for <b>${H(s.q || '')}</b>. Tap one to add it:`, s.kb || [BACK]);
   if (k === 'd') return show(c, '⚠️ Delete this title?', [[{ text: '✅ Yes, delete', callback_data: 'D:' + a }, { text: 'Cancel', callback_data: 'm:' + a }]]);
-  if (k === 'D') { await Movie.findByIdAndDelete(a); await Poster.deleteOne({ movie: a }); return show(c, '🗑 Deleted.', [BACK]); }
+  if (k === 'D') { await Movie.findByIdAndDelete(a); return show(c, '🗑 Deleted.', [BACK]); }
   if (k === 'a') {
     const x = s.res[+a]; if (!x) return show(c, 'Search again.', [BACK]);
     await show(c, `⏳ Adding <b>${H(clean(x.title))}</b>… a few seconds`);
     const doc = await build(x.link);
-    const saved = await Movie.findOneAndUpdate({ sourceUrl: doc.sourceUrl }, doc, { upsert: true, new: true });
-    getPoster(saved._id).catch(() => {});
+    await Movie.findOneAndUpdate({ sourceUrl: doc.sourceUrl }, doc, { upsert: true, new: true });
     const row = s.kb?.[+a]?.[0]; if (row) row.text = '✓ ' + row.text.replace(/^✓ /, '');
     return show(c, `✅ Added: <b>${H(clean(doc.title))}</b>`, [[{ text: '📋 Back to results', callback_data: 'rs' }], [{ text: '🔍 New search', callback_data: 's' }, ...BACK]]);
   }
@@ -261,7 +222,7 @@ async function backfill(chat) {
   JOB.run = true; JOB.stop = false;
   let ok = 0, bad = 0;
   try {
-    const list = await Movie.find({ type: { $ne: 'tv' }, $or: [{ 'downloads.0': { $exists: false } }, { 'downloads.url': /cinesubz\.[a-z]+\/|t\.me|telegram\.me/i }] }, 'sourceUrl');
+    const list = await Movie.find({ type: { $ne: 'tv' }, 'downloads.0': { $exists: false } }, 'sourceUrl');
     if (!list.length) return chat && say(chat, '✅ Every movie already has saved download links.');
     const w = chat && await say(chat, `🔗 Saving links for ${list.length} movies…`, STOPKB), c = { chat, mid: w?.result?.message_id };
     let last = 0;
@@ -289,7 +250,7 @@ async function bulk(chat, keywords) {
         const have = new Set((await Movie.find({ sourceUrl: { $in: fresh.map(x => x.link) } }, 'sourceUrl')).map(x => x.sourceUrl));
         const todo = fresh.filter(x => !have.has(x.link));
         for (let i = 0; i < todo.length && !JOB.stop; i += 3) {
-          const r = await Promise.allSettled(todo.slice(i, i + 3).map(async x => { const doc = await build(x.link); await Movie.findOneAndUpdate({ sourceUrl: doc.sourceUrl }, doc, { upsert: true, new: true }).then(v => { getPoster(v._id).catch(() => {}); }); }));
+          const r = await Promise.allSettled(todo.slice(i, i + 3).map(async x => { const doc = await build(x.link); await Movie.findOneAndUpdate({ sourceUrl: doc.sourceUrl }, doc, { upsert: true }); }));
           r.forEach(x => x.status === 'fulfilled' ? added++ : bad++); tick();
         }
       }
@@ -336,4 +297,4 @@ async function poll() {
   }
 }
 poll();
-setTimeout(() => backfill().catch(e => console.error('backfill:', e.message)).finally(() => warmPosters().catch(e => console.error('posters:', e.message))), 20000); // after start: fix links + copy posters into MongoDB
+setTimeout(() => backfill().catch(e => console.error('backfill:', e.message)), 20000); // quietly save links for older movies after start

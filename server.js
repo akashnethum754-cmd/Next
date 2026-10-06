@@ -36,6 +36,23 @@ async function warmPosters() {
 
 // short-lived cache in MongoDB (resolved links, episode lists, cooldowns) so the paid APIs are hit as little as possible
 const Cache = mongoose.model('Cache', new mongoose.Schema({ k: { type: String, unique: true }, v: String, at: { type: Date, default: Date.now, expires: 10800 } }));
+const Setting = mongoose.model('Setting', new mongoose.Schema({ k: { type: String, unique: true }, v: String }));
+let CFG = { ads: true, t: 0 }, BL = { a: [], t: 0 };
+async function adsOn() {
+  if (Date.now() - CFG.t > 3e4) { const x = await Setting.findOne({ k: 'ads' }).catch(() => null); CFG = { ads: x ? x.v !== 'off' : true, t: Date.now() }; }
+  return CFG.ads;
+}
+async function blocked() { // download servers hidden from the site (label or link contains the word)
+  if (Date.now() - BL.t > 3e4) { const x = await Setting.findOne({ k: 'block' }).catch(() => null); let a = ['1ditfile']; try { if (x) a = JSON.parse(x.v); } catch {} BL = { a, t: Date.now() }; }
+  return BL.a;
+}
+const isBlocked = (x, a) => a.some(w => `${x.label || ''} ${x.url || ''}`.toLowerCase().includes(w));
+async function purgeBlocked(words) {
+  let n = 0;
+  for (const w of words) { const r = new RegExp(w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    for (const f of ['label', 'url']) n += (await Movie.updateMany({ ['downloads.' + f]: r }, { $pull: { downloads: { [f]: r } } })).modifiedCount || 0; }
+  return n;
+}
 const cget = async k => { const c = await Cache.findOne({ k }); return c ? JSON.parse(c.v) : null; };
 const cset = (k, v) => Cache.findOneAndUpdate({ k }, { v: JSON.stringify(v), at: new Date() }, { upsert: true }).catch(() => {});
 
@@ -154,9 +171,11 @@ async function buildAnime(link) {
 const SS = 'https://api.chamindu.site/api/v1/movies/sinhalasub';
 const isSS = l => /sinhalasub\./i.test(l || '');
 async function buildSS(link) {
-  const d = await ch('/infodl', { q: link }, SS);
+  const d = await ch('/infodl', { q: link }, SS), bl = await blocked();
+  if (!d.title) throw new Error('no title returned');
   const downloads = (d.downloads || []).filter(x => x.link && !/telegram/i.test((x.name || '') + x.link) && !bad(x.link)).map(x => ({
-    label: `${String(x.quality || '').replace(/^(FHD|HD|SD)\s*/i, '')} [${((x.name || '').match(/\[Movie File\]\s*(.+?)\s+-\s+/) || [0, 'Server'])[1]}]`, size: x.size, url: x.link }));
+    label: `${String(x.quality || '').replace(/^(FHD|HD|SD)\s*/i, '')} [${((x.name || '').match(/\[Movie File\]\s*(.+?)\s+-\s+/) || [0, 'Server'])[1]}]`, size: x.size, url: x.link })).filter(x => !isBlocked(x, bl));
+  if (!downloads.length) throw new Error('no usable download links');
   return {
     sourceUrl: link, type: 'movie', title: d.title, year: yearOf('', d.title), poster: String(d.image || '').replace('/w154/', '/w500/'),
     overview: d.story || '', rating: d.imdb && d.imdb !== 'N/A' ? d.imdb + '/10' : '', director: String(d.director || '').split(',').slice(0, 3).join(',').trim(),
@@ -267,7 +286,7 @@ app.get('/api/links/:id', wrap(async (req, res) => {
   const m = await Movie.findById(req.params.id, 'sourceUrl pages downloads');
   if (!m) return res.status(404).json({ error: 'Not found' });
   if (m.pages.length) return res.json({ pages: m.pages.map(x => ({ label: x.label, url: x.url })) });
-  const good = m.downloads.filter(x => !bad(x.url));
+  const bl = await blocked(), good = m.downloads.filter(x => !bad(x.url) && !isBlocked(x, bl));
   if (good.length) return res.json({ links: good.map(x => ({ label: x.label, size: x.size, url: x.url })) });
   if (await cget('miss:' + m.id)) return res.json({ links: [] }); // recently tried, nothing found
   const r = await freshLinks(m);
@@ -283,6 +302,8 @@ app.post('/api/links/:id/refresh', wrap(async (req, res) => {
   const r = await freshLinks(m);
   res.json(r.pages.length ? { pages: r.pages } : { links: r.downloads });
 }));
+
+app.get('/api/config', wrap(async (req, res) => res.set('Cache-Control', 'public, max-age=30').json({ ads: await adsOn() })));
 
 // ---------- SEO: real page titles/descriptions/social cards per title, sitemap, robots ----------
 const fs = require('fs');
@@ -343,7 +364,7 @@ const say = (chat, text, kb) => tg('sendMessage', { chat_id: chat, text, parse_m
 const show = (c, text, kb) => c.mid ? tg('editMessageText', { chat_id: c.chat, message_id: c.mid, text, parse_mode: 'HTML', reply_markup: { inline_keyboard: kb || [] } }) : say(c.chat, text, kb);
 const BACK = [{ text: '« Menu', callback_data: 'menu' }];
 const MENU = [[{ text: '🔍 Search & add', callback_data: 's' }], [{ text: '🎬 Movies', callback_data: 'l:movie:0' }, { text: '📺 TV series', callback_data: 'l:tv:0' }], [{ text: '🎌 Anime', callback_data: 'l:anime:0' }, { text: '🎌 Search anime', callback_data: 'sa' }], [{ text: '🇱🇰 Search SinhalaSub', callback_data: 'sx' }], [{ text: '⭐ Featured', callback_data: 'l:feat:0' }, { text: '📊 Stats', callback_data: 'st' }], [{ text: '🔒 Log out', callback_data: 'out' }]];
-const HOME = '🎬 <b>SHAGGY MOVIES admin</b>\nSend a movie or series name to search and add it.\n\n<b>Commands</b>\n/bulk word : add every result of a search\n/bulkall : add everything from all 3 sources (or /bulkall anime)\n/links : save download links for all movies\n/anime name : search anime\n/ss name : search SinhalaSub\n/go 100,ANIME : add 100 new titles (CINESUBZ, SINHALASUB or ANIME)\n/stop : stop a running job';
+const HOME = '🎬 <b>SHAGGY MOVIES admin</b>\nSend a movie or series name to search and add it.\n\n<b>Commands</b>\n/bulk word : add every result of a search\n/bulkall : add everything from all 3 sources (or /bulkall anime)\n/links : save download links for all movies\n/anime name : search anime\n/ss name : search SinhalaSub\n/go 100,ANIME : add 100 new titles (CINESUBZ, SINHALASUB or ANIME)\n/stats : numbers\n/recent : last 10 added\n/find word : search your library\n/missing : movies without links\n/dupes : duplicate titles\n/ads on|off : show or hide ads\n/posters : save missing posters\n/blocklink name : hide a download server everywhere\n/clearcache : clear link caches\n/stop : stop a running job';
 const q4 = t => t === 'tv' ? { type: 'tv' } : t === 'anime' ? { type: 'anime' } : t === 'feat' ? { featured: true } : { type: { $nin: ['tv', 'anime'] } };
 
 async function searchAll(q, page = 1) { // laksidu first; chamindu only if laksidu fails
@@ -392,8 +413,10 @@ async function act(c, s, d) {
   if (k === 'sa') { s.mode = 'anime'; return show(c, '🎌 Send the anime name.', [BACK]); }
   if (k === 's') { s.mode = ''; return show(c, '🔍 Send the movie or series name.', [BACK]); }
   if (k === 'st') {
-    const [m, t, f, an] = await Promise.all([Movie.countDocuments({ type: { $nin: ['tv', 'anime'] } }), Movie.countDocuments({ type: 'tv' }), Movie.countDocuments({ featured: true }), Movie.countDocuments({ type: 'anime' })]);
-    return show(c, `📊 <b>Stats</b>\n🎬 Movies: ${m}\n📺 TV series: ${t}\n🎌 Anime: ${an}\n⭐ Featured: ${f}`, [BACK]);
+    const day = new Date(Date.now() - 864e5), nl = { type: { $nin: ['tv', 'anime'] }, 'downloads.0': { $exists: false }, 'pages.0': { $exists: false } };
+    const [m, t, an, f, today, nolinks, posters, ads] = await Promise.all([Movie.countDocuments({ type: { $nin: ['tv', 'anime'] } }), Movie.countDocuments({ type: 'tv' }), Movie.countDocuments({ type: 'anime' }), Movie.countDocuments({ featured: true }),
+      Movie.countDocuments({ createdAt: { $gt: day } }), Movie.countDocuments(nl), Poster.countDocuments(), adsOn()]);
+    return show(c, `📊 <b>Stats</b>\n🎬 Movies: ${m}\n📺 TV series: ${t}\n🎌 Anime: ${an}\n⭐ Featured: ${f}\n🆕 Added in 24h: ${today}\n🔗 Movies without links: ${nolinks}\n🖼 Posters saved: ${posters}/${m + t + an}\n📢 Ads: ${ads ? 'ON' : 'OFF'}\n⚙️ Job: ${JOB.run ? 'running' : 'idle'}\n⏱ Uptime: ${Math.round(process.uptime() / 3600)}h`, [BACK]);
   }
   if (k === 'out') { s.until = 0; return show(c, '🔒 Logged out.'); }
   if (k === 'l') return listView(c, a, +b || 0);
@@ -419,13 +442,40 @@ const STOPKB = [[{ text: '🛑 Stop', callback_data: 'stop' }]];
 const ALLKW = [...Array.from({ length: 47 }, (_, i) => String(2026 - i)), ...'abcdefghijklmnopqrstuvwxyz0123456789'.split(''),
   'action', 'comedy', 'horror', 'thriller', 'drama', 'romance', 'animation', 'crime', 'war', 'adventure', 'fantasy', 'family', 'mystery', 'korean', 'hindi', 'tamil', 'anime', 'sinhala', 'complete'];
 const ANIMEKW = [...'abcdefghijklmnopqrstuvwxyz'.split(''), 'naruto', 'one piece', 'dragon ball', 'solo leveling', 'attack on titan', 'demon slayer', 'jujutsu', 'bleach', 'hunter', 'boruto', 'hero academia', 'tokyo', 'sword art', 'death note', 'season 2', 'season 3', 'movie', 'ova'];
+const WORDS = ['the', 'man', 'love', 'war', 'king', 'dark', 'night', 'last', 'dead', 'blood', 'girl', 'boy', 'home', 'city', 'life', 'world', 'black', 'white', 'red', 'big', 'little', 'house', 'power', 'secret', 'return', 'rise', 'day', 'fire', 'ice', 'dragon', 'star', 'killer', 'game', 'story', 'dream', 'road', 'island', 'crime', 'lost', 'young', 'new', 'great', 'mission', 'agent', 'spider', 'super', 'iron', 'fast', 'dual audio', 'bluray', 'hdrip', 'tamil', 'telugu', 'malayalam', 'kannada', 'chinese', 'japanese', 'thai', 'turkish', 'french', 'spanish', 'german', 'russian', 'bollywood', 'hollywood', 'part 2', 'chapter', 'origins', 'legend', 'revenge', 'escape', 'hunt', 'empire', 'kingdom', 'shadow', 'ghost', 'demon', 'zombie', 'alien', 'space', 'time', 'future', 'robot', 'cop', 'police', 'prison', 'gangster', 'heist', 'soldier', 'army', 'pirate', 'vampire', 'witch', 'magic', 'school', 'family', 'wedding', 'baby', 'sister', 'brother', 'mother', 'father', 'friends', 'summer', 'winter', 'christmas'];
+const UA = { 'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36', Accept: 'application/json,text/xml,*/*' };
+const unent = t => String(t || '').replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n)).replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/<[^>]+>/g, '').trim();
+// whole catalogue of a WordPress movie site, page by page: REST API first, sitemap files as a backup
+async function wpList(site, kinds, p, note) {
+  const out = [];
+  for (const [kind, type] of kinds) {
+    let got = null;
+    try {
+      const r = await fetch(`${site}/wp-json/wp/v2/${kind}?per_page=100&page=${p}&_fields=link,title`, { headers: UA, signal: AbortSignal.timeout(25000) });
+      if (r.status === 400) continue; // past the last page
+      if (r.ok) got = (await r.json()).map(x => ({ title: unent(x.title?.rendered), link: x.link, type })); else note(`${kind} REST ${r.status}`);
+    } catch (e) { note(`${kind} REST ${e.message.slice(0, 30)}`); }
+    if (!got) for (const u of [`${site}/${kind}-sitemap${p > 1 ? p : ''}.xml`, `${site}/wp-sitemap-posts-${kind}-${p}.xml`]) {
+      try {
+        const r = await fetch(u, { headers: UA, signal: AbortSignal.timeout(25000) });
+        if (!r.ok) { note(`${kind} sitemap ${r.status}`); continue; }
+        got = [...(await r.text()).matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/g)].map(m => m[1]).filter(l => l.includes(`/${kind}/`)).map(l => ({ title: l.split('/').filter(Boolean).pop().replace(/-/g, ' '), link: l, type }));
+        break;
+      } catch (e) { note(`${kind} sitemap ${e.message.slice(0, 30)}`); }
+    }
+    if (got) out.push(...got);
+  }
+  return out;
+}
+const cineList = (p, note) => wpList((E.CINE_SITE || 'https://cinesubz.net').replace(/\/$/, ''), [['movies', 'movie'], ['tvshows', 'tv']], p, note);
+const ssList = (p, note) => wpList((E.SS_SITE || 'https://sinhalasub.lk').replace(/\/$/, ''), [['movies', 'movie']], p, note);
 const norm = t => clean(t).toLowerCase().replace(/[^a-z0-9\u0d80-\u0dff]+/g, '');
 async function searchSS(q, page = 1) { // SinhalaSub (movies only)
   if (page > 1) return [];
   const d = await ch('/search', { q }, SS);
   return d.map(x => ({ title: x.title, link: x.link, type: x.type === 'tvshows' || /\/tvshows\//.test(x.link) ? 'tv' : 'movie' })).filter(x => x.link && x.type === 'movie');
 }
-const SRC = { CINESUBZ: { find: searchAll, kw: ALLKW }, SINHALASUB: { find: searchSS, kw: ALLKW }, ANIME: { find: (q, p) => p > 1 ? [] : searchAnime(q), kw: ANIMEKW } };
+const SRC = { CINESUBZ: { find: searchAll, kw: [...ALLKW, ...WORDS], list: cineList }, SINHALASUB: { find: searchSS, kw: [...ALLKW, ...WORDS], list: ssList }, ANIME: { find: (q, p) => p > 1 ? [] : searchAnime(q), kw: ANIMEKW } };
 const SRC_ALIAS = { CINE: 'CINESUBZ', CINESUBZ: 'CINESUBZ', SS: 'SINHALASUB', SINHALA: 'SINHALASUB', SINHALASUB: 'SINHALASUB', ANIME: 'ANIME' };
 
 // save download links for every movie that has none yet
@@ -446,39 +496,62 @@ async function backfill(chat) {
     if (chat) say(chat, `✅ Links finished${JOB.stop ? ' (stopped)' : ''}\nSaved: ${ok}\nNo links found: ${bad}`);
   } finally { JOB.run = false; }
 }
-// add many NEW titles. plan = [{ name, find, kw }], limit = how many new titles to add (titles already on the site are skipped)
+// add many NEW titles. plan = [{ name, find, kw, list? }], limit = how many new titles to add. Titles already on the site are skipped.
+const pk = l => { try { const u = new URL(l); return 'p:' + u.pathname + u.search; } catch { return 'l:' + l; } };
+const nk = t => { const k = norm(t); return k.length > 3 ? 'n:' + k : null; };
 async function bulk(chat, plan, limit = Infinity) {
   if (JOB.run) return say(chat, '⏳ Another job is running. Send /stop to cancel it.');
   JOB.run = true; JOB.stop = false;
   const w = await say(chat, '📥 Starting…', STOPKB), c = { chat, mid: w.result?.message_id };
-  let added = 0, bad = 0, last = 0, done = 0, cur = plan[0]?.name;
-  const total = plan.reduce((a, p) => a + p.kw.length, 0);
-  const tick = () => { if (Date.now() - last > 4000) { last = Date.now(); show(c, `📥 Adding from <b>${cur}</b>…\n🔎 Searches: ${done}/${total}\n✅ Added: ${added}${limit < Infinity ? ' / ' + limit : ''}\n⚠️ Failed: ${bad}`, STOPKB); } };
+  let added = 0, bad = 0, found = 0, scanned = 0, errs = 0, last = 0, cur = plan[0]?.name, step = '';
+  const notes = new Set(), why = {};
+  const info = n => [...Object.entries(why).sort((x, y) => y[1] - x[1]).slice(0, 3).map(([k, v]) => `${k} ×${v}`), ...[...notes].slice(0, 3)].slice(0, n).map(H).join('\n');
+  const tick = () => { if (Date.now() - last > 4000) { last = Date.now(); show(c, `📥 Adding from <b>${cur}</b>\n${H(step)}\n🔍 Scanned: ${scanned}\n🆕 New found: ${found}\n✅ Added: ${added}${limit < Infinity ? ' / ' + limit : ''}\n⚠️ Failed: ${bad}   Search errors: ${errs}${info(4) ? '\nℹ️ ' + info(4) : ''}`, STOPKB); } };
   try {
-    const have = new Set((await Movie.find({}, 'title sourceUrl')).flatMap(m => [norm(m.title), m.sourceUrl]));
+    const have = new Set();
+    for (const m of await Movie.find({}, 'title sourceUrl')) { have.add(pk(m.sourceUrl)); const k = nk(m.title); if (k) have.add(k); }
+    const make = async x => { // never save empty titles or movies without any download link
+      const doc = await build(x.link);
+      if (!doc.title) throw new Error('no title');
+      if (doc.type === 'movie' && !doc.pages?.length && !doc.downloads?.length) throw new Error('no download links');
+      if (doc.type !== 'movie' && !doc.episodes?.length) throw new Error('no episodes');
+      const v = await save(doc); getPoster(v._id).catch(() => {});
+    };
+    const take = async items => {
+      scanned += items.length;
+      const todo = items.filter(x => x.link && !have.has(pk(x.link)) && !(nk(x.title) && have.has(nk(x.title))));
+      todo.forEach(x => { have.add(pk(x.link)); const k = nk(x.title); if (k) have.add(k); });
+      found += todo.length;
+      for (let i = 0; i < todo.length && !JOB.stop && added < limit; i += 3) {
+        const r = await Promise.allSettled(todo.slice(i, i + Math.min(3, limit - added)).map(make));
+        r.forEach(x => { if (x.status === 'fulfilled') added++; else { bad++; const k = String(x.reason?.message || 'error').slice(0, 40); why[k] = (why[k] || 0) + 1; } }); tick();
+      }
+    };
     for (const src of plan) {
-      cur = src.name;
-      for (const kw of src.kw) {
-        if (JOB.stop || added >= limit) break;
-        const seen = new Set();
+      cur = src.name; let listed = false;
+      if (src.list) { // 1) the site's full catalogue
+        for (let p = 1; p <= 500 && !JOB.stop && added < limit; p++) {
+          step = `📚 Catalogue page ${p}`; let items = [];
+          try { items = await src.list(p, n => notes.add(n)); } catch (e) { errs++; notes.add(e.message.slice(0, 40)); }
+          if (!items.length) break;
+          listed = true; await take(items); tick();
+        }
+        if (!listed) notes.add('catalogue unavailable, using keyword search');
+      }
+      if (!listed) for (let i = 0; i < src.kw.length && !JOB.stop && added < limit; i++) { // 2) keyword search
+        const kw = src.kw[i], seen = new Set(); step = `🔎 Keyword ${i + 1}/${src.kw.length}: ${kw}`;
         for (let p = 1; p <= 5 && !JOB.stop && added < limit; p++) {
-          let res; try { res = await src.find(kw, p); } catch { break; }
+          let res = []; try { res = await src.find(kw, p); } catch (e) { errs++; notes.add(('search: ' + e.message).slice(0, 40)); break; }
           const fresh = res.filter(x => !seen.has(x.link)); fresh.forEach(x => seen.add(x.link));
           if (!fresh.length) break;
-          const todo = fresh.filter(x => !have.has(x.link) && !have.has(norm(x.title)));
-          todo.forEach(x => { have.add(x.link); have.add(norm(x.title)); });
-          for (let i = 0; i < todo.length && !JOB.stop && added < limit; i += 3) {
-            const r = await Promise.allSettled(todo.slice(i, i + Math.min(3, limit - added)).map(async x => { const v = await save(await build(x.link)); getPoster(v._id).catch(() => {}); }));
-            r.forEach(x => x.status === 'fulfilled' ? added++ : bad++); tick();
-          }
+          await take(fresh);
         }
-        done++; tick();
+        tick();
       }
-      done = plan.slice(0, plan.indexOf(src) + 1).reduce((a, p) => a + p.kw.length, 0);
       if (JOB.stop || added >= limit) break;
     }
   } finally { JOB.run = false; }
-  say(chat, `✅ Finished${JOB.stop ? ' (stopped)' : ''}\nAdded: ${added}\nFailed: ${bad}`);
+  say(chat, `✅ Finished${JOB.stop ? ' (stopped)' : ''}\nScanned: ${scanned}\nNew found: ${found}\nAdded: ${added}\nFailed: ${bad}\nSearch errors: ${errs}${info(5) ? '\nℹ️ ' + info(5) : ''}`);
 }
 async function handle(u) {
   const cb = u.callback_query, msg = u.message, from = (cb || msg)?.from; if (!from) return;
@@ -502,6 +575,43 @@ async function handle(u) {
   if (cb) { tg('answerCallbackQuery', { callback_query_id: cb.id }); return act({ chat, mid: cb.message.message_id }, s, cb.data).catch(e => say(chat, '⚠️ ' + H(e.message))); }
   if (/^\/stop\b/.test(text)) { JOB.stop = true; return say(chat, '🛑 Stopping after the current step…'); }
   if (/^\/links\b/.test(text)) return backfill(chat).catch(e => say(chat, '⚠️ ' + H(e.message)));
+  const row = m => [{ text: (m.type === 'tv' ? '📺 ' : m.type === 'anime' ? '🎌 ' : '🎬 ') + clean(m.title).slice(0, 46), callback_data: 'm:' + m._id }];
+  if (/^\/stats\b/.test(text)) return act({ chat }, s, 'st').catch(e => say(chat, '⚠️ ' + H(e.message)));
+  if (/^\/recent\b/.test(text)) return say(chat, '🆕 <b>Recently added</b>', [...(await Movie.find({}, 'title type').sort({ createdAt: -1 }).limit(10)).map(row), BACK]);
+  if (/^\/find\b/.test(text)) {
+    const w = text.replace(/^\/find\s*/, '').trim(); if (!w) return say(chat, 'Use: <code>/find avatar</code>');
+    const L = await Movie.find({ title: rx(w) }, 'title type').sort({ createdAt: -1 }).limit(10);
+    return say(chat, L.length ? `🔎 In your library: <b>${H(w)}</b>` : 'Nothing in your library matches that.', [...L.map(row), BACK]);
+  }
+  if (/^\/missing\b/.test(text)) {
+    const f = { type: { $nin: ['tv', 'anime'] }, 'downloads.0': { $exists: false }, 'pages.0': { $exists: false } };
+    const [n, L] = await Promise.all([Movie.countDocuments(f), Movie.find(f, 'title type').limit(10)]);
+    return say(chat, `🔗 Movies without download links: <b>${n}</b>${n ? '\nSend /links to fetch them.' : ''}`, [...L.map(row), BACK]);
+  }
+  if (/^\/dupes\b/.test(text)) {
+    const G = new Map(); for (const m of await Movie.find({}, 'title type').sort({ createdAt: 1 })) { const k = nk(m.title); if (k) G.set(k, [...(G.get(k) || []), m]); }
+    const D = [...G.values()].filter(g => g.length > 1);
+    return say(chat, `♊ Duplicate titles: <b>${D.length}</b>\nThe newer copy of each is listed. Tap it to open and delete.`, [...D.slice(0, 12).map(g => row(g[g.length - 1])), BACK]);
+  }
+  if (/^\/ads\b/.test(text)) {
+    const a = (text.split(/\s+/)[1] || '').toLowerCase();
+    if (a !== 'on' && a !== 'off') return say(chat, `📢 Ads are <b>${await adsOn() ? 'ON' : 'OFF'}</b>.\nUse <code>/ads on</code> or <code>/ads off</code>`);
+    await Setting.findOneAndUpdate({ k: 'ads' }, { v: a }, { upsert: true }); CFG.t = 0;
+    return say(chat, `📢 Ads turned <b>${a.toUpperCase()}</b>. The site picks it up within a minute.`);
+  }
+  if (/^\/clearcache\b/.test(text)) { await Cache.deleteMany({}); linkCache.clear(); aCache.clear(); SM.t = 0; CFG.t = 0; BL.t = 0; return say(chat, '🧹 Cache cleared.'); }
+  if (/^\/posters\b/.test(text)) { say(chat, '🖼 Saving missing posters in the background…'); warmPosters().then(async () => say(chat, '🖼 Done. Posters saved: ' + await Poster.countDocuments())).catch(e => say(chat, '⚠️ ' + H(e.message))); return; }
+  if (/^\/blocklink\b/.test(text)) {
+    const w = text.replace(/^\/blocklink\s*/, '').trim().toLowerCase(), cur = await blocked();
+    if (!w) return say(chat, `🚫 Blocked download servers: ${cur.length ? cur.map(x => '<code>' + H(x) + '</code>').join(', ') : 'none'}\nAdd: <code>/blocklink name</code>\nRemove: <code>/unblock name</code>`);
+    await Setting.findOneAndUpdate({ k: 'block' }, { v: JSON.stringify([...new Set([...cur, w])]) }, { upsert: true }); BL.t = 0;
+    return say(chat, `🚫 Blocked <code>${H(w)}</code>. Removed from ${await purgeBlocked([w])} movies. It is also skipped when adding new titles.`);
+  }
+  if (/^\/unblock\b/.test(text)) {
+    const w = text.replace(/^\/unblock\s*/, '').trim().toLowerCase(), cur = await blocked();
+    await Setting.findOneAndUpdate({ k: 'block' }, { v: JSON.stringify(cur.filter(x => x !== w)) }, { upsert: true }); BL.t = 0;
+    return say(chat, `✅ <code>${H(w)}</code> is no longer blocked (removed links are not restored; use Refresh on a movie).`);
+  }
   if (/^\/go\b/.test(text)) {
     const g = text.match(/^\/go\s+(\d+)\s*[, ]\s*([a-z]+)/i), key = g && SRC_ALIAS[g[2].toUpperCase()];
     if (!g || !key || +g[1] < 1) return say(chat, 'Use: <code>/go 100,ANIME</code>\nSources: CINESUBZ, SINHALASUB, ANIME');
@@ -531,7 +641,7 @@ async function handle(u) {
 async function poll() {
   if (!E.TG_BOT_TOKEN) return console.log('Telegram bot off (no TG_BOT_TOKEN)');
   await tg('deleteWebhook');
-  tg('setMyCommands', { commands: [{ command: 'menu', description: 'Open menu' }, { command: 'login', description: 'Unlock with PIN' }, { command: 'bulk', description: 'Add all results of a search' }, { command: 'bulkall', description: 'Add as many movies as possible' }, { command: 'links', description: 'Save links for all movies' }, { command: 'anime', description: 'Search and add anime' }, { command: 'ss', description: 'Search SinhalaSub' }, { command: 'go', description: 'Add N new titles, e.g. /go 100,ANIME' }, { command: 'stop', description: 'Stop running job' }] }); console.log('Telegram bot running'); let off = 0;
+  tg('setMyCommands', { commands: [{ command: 'menu', description: 'Open menu' }, { command: 'login', description: 'Unlock with PIN' }, { command: 'bulk', description: 'Add all results of a search' }, { command: 'bulkall', description: 'Add as many movies as possible' }, { command: 'links', description: 'Save links for all movies' }, { command: 'anime', description: 'Search and add anime' }, { command: 'ss', description: 'Search SinhalaSub' }, { command: 'go', description: 'Add N new titles, e.g. /go 100,ANIME' }, { command: 'stats', description: 'Site numbers' }, { command: 'recent', description: 'Last 10 added' }, { command: 'find', description: 'Search your library' }, { command: 'missing', description: 'Movies without links' }, { command: 'dupes', description: 'Duplicate titles' }, { command: 'ads', description: 'Ads on or off' }, { command: 'posters', description: 'Save missing posters' }, { command: 'blocklink', description: 'Hide a download server' }, { command: 'clearcache', description: 'Clear caches' }, { command: 'stop', description: 'Stop running job' }] }); console.log('Telegram bot running'); let off = 0;
   for (;;) {
     const r = await tg('getUpdates', { offset: off, timeout: 30, allowed_updates: ['message', 'callback_query'] });
     if (!r.ok) { await new Promise(x => setTimeout(x, 5000)); continue; }
@@ -539,4 +649,4 @@ async function poll() {
   }
 }
 poll();
-setTimeout(() => warmPosters().catch(e => console.error('posters:', e.message)), 20000); // after start: copy any missing posters into MongoDB (no API cost)
+setTimeout(async () => { await purgeBlocked(await blocked()).catch(() => {}); warmPosters().catch(e => console.error('posters:', e.message)); }, 20000); // after start: remove blocked servers, copy missing posters (no API cost)

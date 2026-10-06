@@ -2,7 +2,6 @@
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="referrer" content="no-referrer">
 <meta name="theme-color" content="#0a0710">
 <!--SEO-->
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 36 36'%3E%3Crect width='36' height='36' rx='10' fill='%23e11d48'/%3E%3Cpath d='M14 9.5v17l14-8.5z' fill='%23fff'/%3E%3C/svg%3E">
@@ -79,6 +78,8 @@ footer b{font:700 18px Oswald;color:var(--txt);letter-spacing:1px;display:block;
 .note{color:var(--mute);font-size:13px;margin:6px 0 12px}
 .row{display:flex;gap:10px;align-items:center;padding:10px 0;border-bottom:1px solid var(--line)}.row .t{flex:1;min-width:0}
 select.btn{appearance:none;padding-right:16px}
+.ad{grid-column:1/-1;display:flex;flex-direction:column;align-items:center;margin:16px 0;max-width:100%;overflow:hidden}.dt .ad{margin:28px 0}
+.ad small{color:var(--mute);font-size:10px;letter-spacing:1.2px;text-transform:uppercase;margin-bottom:4px}.ad iframe{border:0;max-width:100%;background:transparent}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 </style></head><body>
 <header>
@@ -104,6 +105,13 @@ const ct=t=>String(t||'').replace(/\s*Sinhala Subtitles.*$/i,'').replace(/\s*\|.
 const yr=m=>/^\d{4}$/.test(String(m.year||'').trim())?String(m.year).trim():(String(m.title||'').match(/\((\d{4})\)/)||[])[1]||'';
 const slug=t=>ct(t).toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,80)||'movie';
 const DEF='SHAGGY MOVIES – Download movies, TV series & anime with Sinhala subtitles';
+let ADS=true;const cfgP=api('/config').then(c=>{ADS=c.ads!==false}).catch(()=>{});
+// Adsterra banners: 728x90 on wide screens, 160x300 on phones, each in its own lazy iframe so it never slows the page.
+function adHtml(){
+  if(!ADS)return '';
+  const wide=innerWidth>=768,k=wide?'dddc590e36a17c3209db632d3d17cfc0':'7666b2eb78b35b8a2ac375767a90dc08',w=wide?728:160,h=wide?90:300;
+  const doc=`<!doctype html><html><body style="margin:0;background:transparent"><script>atOptions={'key':'${k}','format':'iframe','height':${h},'width':${w},'params':{}};<\/script><script src="https://www.highrevenueformat.com/${k}/invoke.js"><\/script></body></html>`;
+  return `<div class="ad"><small>Advertisement</small><iframe loading="lazy" width="${w}" height="${h}" scrolling="no" frameborder="0" title="Advertisement" srcdoc="${esc(doc)}"></iframe></div>`}
 let page=1,pages=1,query='',F={},title='Latest',loading=false,seq=0;
 async function api(p){const r=await fetch('/api'+p),j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||'Something went wrong');return j}
 function setMeta(t,d){document.title=t||DEF;const m=document.querySelector('meta[name=description]');if(m&&d)m.content=d}
@@ -130,7 +138,7 @@ function go(i){const a=ACT[i];F=a.f;title=a.t;query='';$('#q').value='';menu(fal
 // ---- listing ----
 const skel=n=>Array(n).fill('<div class="card sk"><div class="im"></div><b></b><span></span></div>').join('');
 const card=(m,i)=>`<a class="card" style="animation-delay:${(i%12)*30}ms" href="/m/${m._id}/${slug(m.title)}" onclick="return nav(event,'${m._id}')">${m.type==='tv'?'<i class="bd">TV</i>':m.type==='anime'?'<i class="bd">ANIME</i>':''}${m.rating?`<i class="rt">★ ${esc(String(m.rating).replace('/10',''))}</i>`:''}<img class="im" loading="lazy" decoding="async" src="/img/${m._id}" data-o="${esc(m.poster)}" onerror="imgFix(this)" alt="${esc(ct(m.title))}"><b>${esc(ct(m.title))}</b><span>${esc(yr(m))}</span></a>`;
-function imgFix(i){i.onerror=null;if(i.dataset.o)i.src=i.dataset.o}
+function imgFix(i){i.onerror=null;if(i.dataset.o){i.referrerPolicy='no-referrer';i.src=i.dataset.o}}
 function nav(e,id){if(e.metaKey||e.ctrlKey||e.shiftKey||e.button)return true;openMovie(id);return false}
 async function load(reset=true){
   const my=++seq;if(!reset&&loading)return;loading=true;
@@ -145,7 +153,9 @@ async function load(reset=true){
       $('#ttl').textContent=query?`Results for "${query}"`:title;
       if(!d.items.length)$('#grid').innerHTML='<p class="empty">Nothing here yet.</p>';
     }
-    if(d.items.length)$('#grid').insertAdjacentHTML('beforeend',d.items.map(card).join(''));
+    if(d.items.length){await cfgP;if(my!==seq)return;const cs=d.items.map((m,i)=>card(m,i));
+      if(page===1&&cs.length>12)cs.splice(12,0,adHtml());else if(page>1&&page%3===0)cs.push(adHtml());
+      $('#grid').insertAdjacentHTML('beforeend',cs.join(''))}
   }catch(e){if(my===seq)$('#grid').innerHTML=`<p class="empty">${esc(e.message)}</p>`}
   if(my===seq)loading=false;
 }
@@ -199,6 +209,7 @@ async function openMovie(id,push=true){
   try{
     const m=await api('/movies/'+id),meta=(k,l)=>m[k]?`<div><b>${l}:</b> ${esc(m[k])}</div>`:'';
     m.country=[...new Set(String(m.country||'').split(',').map(x=>x.trim()).filter(Boolean))].join(', ');
+    await cfgP;
     const url='/m/'+id+'/'+slug(m.title);
     if(push)history.pushState({m:id},'',url);else if(!history.state)history.replaceState({m:id,direct:1},'',location.pathname);
     const ov=(m.overview||'').trim(),short=ov.length>230?ov.slice(0,230).replace(/\s+\S*$/,'')+'…':ov;OV={full:ov,short};
@@ -210,7 +221,7 @@ async function openMovie(id,push=true){
       <button class="btn big" onclick="$('#dlh').scrollIntoView({behavior:'smooth'})">⬇ Download</button></div></div>
       ${ov?`<p class="ov" id="ovt">${esc(short)}</p>${ov.length>230?'<button class="btn alt sm" data-f="0" onclick="rm(this)">Read more</button>':''}`:''}
       <div class="facts">${m.cast?.length?`<div><b>Cast:</b> ${m.cast.map(esc).join(', ')}</div>`:''}${meta('director','Director')}${meta('country','Country')}</div>
-      <h2 id="dlh">Download</h2><div id="dls">${m.type==='tv'?tvHtml(m):m.type==='anime'?animeHtml(m):dlSkel}</div>`);
+      ${adHtml()}<h2 id="dlh">Download</h2><div id="dls">${m.type==='tv'?tvHtml(m):m.type==='anime'?animeHtml(m):dlSkel}</div>${innerWidth>=768?adHtml():''}`);
     if(m.type==='tv'&&$('#ss'))eps();
     if(m.type!=='tv'&&m.type!=='anime')loadLinks(id);
   }catch(e){pgShow(`<p class="empty">${esc(e.message)}</p>`)}

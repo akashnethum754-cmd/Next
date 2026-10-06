@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express'), mongoose = require('mongoose'), path = require('path');
 const E = process.env, app = express();
+app.set('trust proxy', 1);
 app.use(express.json());
 
 mongoose.connect(E.MONGODB_URI).then(() => console.log('MongoDB connected')).catch(e => console.error('MongoDB error:', e.message));
@@ -73,6 +74,7 @@ async function infodl(link) {
 const bad = u => { try { return /(^|\.)(cinesubz\.[a-z]+|t\.me|telegram\.me)$/i.test(new URL(u).hostname); } catch { return true; } };
 const toLinks = d => (d.downloads || []).filter(x => x.link && !/telegram/i.test(x.quality) && !bad(x.link)).map(x => ({ label: x.quality, size: x.size, url: x.link }));
 const toPages = d => (d.downloads || []).filter(x => x && x.quality && x.url).map(x => ({ label: x.quality, url: x.url }));
+const yearOf = (y, t) => /^(19|20)\d{2}$/.test(String(y || '').trim()) ? String(y).trim() : (String(t || '').match(/\((\d{4})\)/) || [])[1] || '';
 const uniq = s => [...new Set(String(s || '').split(',').map(x => x.trim()).filter(Boolean))];
 const lakDetails = async link => (await cine('/cinesubz/details', { url: link })).data;
 
@@ -86,6 +88,7 @@ const inflight = new Map();
 function freshLinks(m) { // laksidu first; chamindu only if laksidu fails. Result is saved in MongoDB.
   const k = String(m._id);
   if (!inflight.has(k)) inflight.set(k, (async () => {
+    if (isSS(m.sourceUrl)) { const dl = (await buildSS(m.sourceUrl)).downloads; if (dl.length) await Movie.findByIdAndUpdate(m._id, { downloads: dl, linksAt: new Date() }); return { pages: [], downloads: dl }; }
     let pages = [], downloads = [];
     try { pages = toPages(await lakDetails(m.sourceUrl)); } catch (e) { console.error('laksidu details:', e.message); }
     if (!pages.length) { try { linkCache.delete(m.sourceUrl); downloads = toLinks(await infodl(m.sourceUrl)); } catch (e) { console.error('fallback infodl:', e.message); } }
@@ -97,6 +100,7 @@ function freshLinks(m) { // laksidu first; chamindu only if laksidu fails. Resul
 }
 
 async function build(link) {
+  if (isSS(link)) return buildSS(link);
   if (isAnime(link)) return buildAnime(link);
   if (isTv(link)) {
     const d = (await cine('/cinesubz/tvshow', { url: link })).data;
@@ -104,13 +108,13 @@ async function build(link) {
       const parts = String(ep.number || '1').split(/\s*-\s*/);
       return { season: parts.length > 1 ? parseInt(parts[0]) || 1 : 1, number: parts[parts.length - 1], title: ep.title || 'Episode', url: ep.url };
     }).filter(e => e.url);
-    return { sourceUrl: link, type: 'tv', title: d.title, year: d.year, poster: d.poster, overview: d.description, rating: d.rating?.score ? String(d.rating.score) : '', episodes };
+    return { sourceUrl: link, type: 'tv', title: d.title, year: yearOf(d.year, d.title), poster: d.poster, overview: d.description, rating: d.rating?.score ? String(d.rating.score) : '', episodes };
   }
   let d; try { d = await lakDetails(link); } catch (e) { console.error('laksidu details failed, using fallback:', e.message); }
   if (d?.title) {
     const arr = v => Array.isArray(v) ? v.map(x => typeof x === 'string' ? x : x?.name) : uniq(v);
     return {
-      sourceUrl: link, type: 'movie', title: d.title, year: d.year, poster: d.poster,
+      sourceUrl: link, type: 'movie', title: d.title, year: yearOf(d.year, d.title), poster: d.poster,
       overview: String(d.description || '').slice(0, 700), rating: d.imdb_rating ? d.imdb_rating + '/10' : '',
       runtime: d.runtime, director: d.director, country: uniq(d.country).join(', '),
       cast: arr(d.cast).filter(Boolean).slice(0, 8), genres: arr(d.genres || d.genre).filter(g => g && !/^[#.]/.test(g)),
@@ -119,7 +123,7 @@ async function build(link) {
   }
   const c = await infodl(link); // paid fallback
   return {
-    sourceUrl: link, type: 'movie', title: c.title, year: c.year, poster: c.image,
+    sourceUrl: link, type: 'movie', title: c.title, year: yearOf(c.year, c.title), poster: c.image,
     overview: (c.story || '').split('\n\n')[0].slice(0, 700), rating: c.rating && c.rating !== 'N/A' ? c.rating : '',
     runtime: c.duration, director: c.director, country: uniq(c.country).join(', '),
     cast: (c.cast || []).slice(0, 8).map(x => x.name), genres: (c.genres || []).filter(g => !/^[#.]/.test(g) && !/^(hdcam|cam)$/i.test(g)),
@@ -144,6 +148,19 @@ async function buildAnime(link) {
       season: 1, number: String(String(e.title || e.name || '').match(/\d+/)?.[0] || i + 1), title: e.title || e.name || 'Episode ' + (i + 1),
       url: e.id || (String(e.link || e.direct_link || '').match(/\?([0-9a-f]{16,})/) || [])[1] || ''
     }))
+  };
+}
+// ---- SinhalaSub (chamindu, paid): everything incl. download links is saved in MongoDB when the title is added ----
+const SS = 'https://api.chamindu.site/api/v1/movies/sinhalasub';
+const isSS = l => /sinhalasub\./i.test(l || '');
+async function buildSS(link) {
+  const d = await ch('/infodl', { q: link }, SS);
+  const downloads = (d.downloads || []).filter(x => x.link && !/telegram/i.test((x.name || '') + x.link) && !bad(x.link)).map(x => ({
+    label: `${String(x.quality || '').replace(/^(FHD|HD|SD)\s*/i, '')} [${((x.name || '').match(/\[Movie File\]\s*(.+?)\s+-\s+/) || [0, 'Server'])[1]}]`, size: x.size, url: x.link }));
+  return {
+    sourceUrl: link, type: 'movie', title: d.title, year: yearOf('', d.title), poster: String(d.image || '').replace('/w154/', '/w500/'),
+    overview: d.story || '', rating: d.imdb && d.imdb !== 'N/A' ? d.imdb + '/10' : '', director: String(d.director || '').split(',').slice(0, 3).join(',').trim(),
+    cast: (d.cast || []).slice(0, 8).map(c => c.name), genres: d.genres || [], downloads, linksAt: new Date()
   };
 }
 const permitted = async u => !!(await Movie.exists({ $or: [{ 'pages.url': u }, { 'downloads.url': u }] })) || !!(await Cache.exists({ k: 'ok:' + u }));
@@ -183,16 +200,39 @@ app.get('/api/episode', wrap(async (req, res) => {
   }
   res.json({ links });
 }));
-// quality page link -> final direct link (one API call, then saved 3h)
+// does this link really serve a file? (checks the first byte only, max 6s)
+const probe = async u => {
+  try {
+    const r = await fetch(u, { headers: { Range: 'bytes=0-0', 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(6000) });
+    r.body?.cancel?.().catch(() => {});
+    return (r.status === 200 || r.status === 206) && !/text\/html/i.test(r.headers.get('content-type') || '');
+  } catch { return false; }
+};
+async function fallbackOpts(mid, pageUrl) { // paid fallback, only when the main download API gives nothing
+  try {
+    const m = await Movie.findById(mid, 'sourceUrl pages'); if (!m) return [];
+    const res = ((m.pages.find(p => p.url === pageUrl)?.label || '').match(/\d{3,4}p/) || [])[0];
+    return toLinks(await infodl(m.sourceUrl)).filter(l => !res || l.label.includes(res)).map(l => ({ name: (l.label.match(/\[(.*?)\]/) || [0, 'Server'])[1], url: l.url }));
+  } catch (e) { console.error('fallback links:', e.message); return []; }
+}
+// quality page link -> working download links. Every link is checked; the working one goes first. Saved 30 min.
 app.get('/api/resolve', wrap(async (req, res) => {
   const url = String(req.query.url || '');
   if (!await permitted(url)) return res.status(403).json({ error: 'Not allowed' });
-  const hit = await cget('r:' + url); if (hit) return res.json({ url: hit });
-  const d = (await cine('/dl/cinesubz', { url }, 3)).data;
-  const ok = (d?.download || []).filter(l => l.name && l.name.toLowerCase() !== 'telegram' && l.url && !bad(l.url));
-  const pick = ok.find(l => l.name === 'unknown') || ok[0];
-  if (!pick) return res.status(404).json({ error: 'No download link available right now' });
-  cset('r:' + url, pick.url); res.json({ url: pick.url });
+  const hit = await cget('r:' + url);
+  if (hit?.v && Date.now() - hit.t < 30 * 60e3) return res.json(hit.v);
+  let opts = [];
+  try {
+    const d = (await cine('/dl/cinesubz', { url }, 3)).data;
+    opts = (d?.download || []).filter(l => l.name && l.name.toLowerCase() !== 'telegram' && l.url && !bad(l.url))
+      .map(l => ({ name: l.name === 'unknown' ? 'Direct' : l.name, url: l.url })).sort((x, y) => (x.name === 'Direct' ? 0 : 1) - (y.name === 'Direct' ? 0 : 1));
+  } catch (e) { console.error('download api:', e.message); }
+  if (!opts.length && req.query.m) opts = await fallbackOpts(String(req.query.m), url);
+  if (!opts.length) return res.status(404).json({ error: 'No working download link right now. Please try again in a few minutes.' });
+  const ok = await Promise.all(opts.map(o => probe(o.url)));
+  const ordered = [...opts.filter((_, i) => ok[i]), ...opts.filter((_, i) => !ok[i])];
+  const out = { url: ordered[0].url, verified: ok.some(Boolean), alts: ordered };
+  cset('r:' + url, { t: Date.now(), v: out }); res.json(out);
 }));
 
 const { Readable } = require('stream');
@@ -244,7 +284,47 @@ app.post('/api/links/:id/refresh', wrap(async (req, res) => {
   res.json(r.pages.length ? { pages: r.pages } : { links: r.downloads });
 }));
 
-app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
+// ---------- SEO: real page titles/descriptions/social cards per title, sitemap, robots ----------
+const fs = require('fs');
+const HTML = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+const X = v => String(v ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const baseUrl = req => (E.SITE_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
+const slug = t => clean(t).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80) || 'movie';
+function sendPage(req, res, o, status = 200) {
+  const b = baseUrl(req), url = b + (o.path || '/');
+  const tags = `<title>${X(o.title)}</title>
+<meta name="description" content="${X(o.desc)}">
+<link rel="canonical" href="${X(url)}">
+${o.noindex ? '<meta name="robots" content="noindex">\n' : ''}<meta property="og:site_name" content="SHAGGY MOVIES">
+<meta property="og:type" content="${o.type || 'website'}">
+<meta property="og:title" content="${X(o.title)}">
+<meta property="og:description" content="${X(o.desc)}">
+<meta property="og:url" content="${X(url)}">
+${o.img ? `<meta property="og:image" content="${X(b + o.img)}">\n<meta name="twitter:card" content="summary_large_image">\n<meta name="twitter:image" content="${X(b + o.img)}">` : '<meta name="twitter:card" content="summary">'}
+${o.ld ? `<script type="application/ld+json">${JSON.stringify(o.ld).replace(/</g, '\\u003c')}</script>` : ''}`;
+  res.status(status).type('html').send(HTML.replace('<!--SEO-->', () => tags));
+}
+app.get('/m/:id/:slug?', async (req, res) => {
+  const m = await Movie.findById(req.params.id, '-downloads -pages -episodes').catch(() => null);
+  if (!m) return sendPage(req, res, { title: 'Not found | SHAGGY MOVIES', desc: 'This title could not be found.', noindex: true }, 404);
+  const name = clean(m.title), kind = m.type === 'anime' ? 'anime' : m.type === 'tv' ? 'TV series' : 'movie', b = baseUrl(req);
+  const desc = (m.overview || '').replace(/\s+/g, ' ').trim().slice(0, 155) || `Download the ${kind} ${name} with Sinhala subtitles in 480p, 720p and 1080p.${m.genres?.length ? ' ' + m.genres.slice(0, 3).join(', ') + '.' : ''}`;
+  const ld = { '@context': 'https://schema.org', '@type': m.type === 'movie' || !m.type ? 'Movie' : 'TVSeries', name, image: b + '/img/' + m.id, description: desc, genre: (m.genres || []).filter(g => !/^[#.]/.test(g)) };
+  if (/^\d{4}$/.test(m.year || '')) ld.datePublished = m.year;
+  if (m.director) ld.director = { '@type': 'Person', name: m.director.split(',')[0].trim() };
+  if (m.cast?.length) ld.actor = m.cast.slice(0, 5).map(n => ({ '@type': 'Person', name: n }));
+  sendPage(req, res, { title: `${name} ${kind === 'movie' ? 'Sinhala Subtitles – Download' : '– Download All Episodes'} | SHAGGY MOVIES`, desc, path: `/m/${m.id}/${slug(m.title)}`, img: '/img/' + m.id, type: kind === 'movie' ? 'video.movie' : 'video.tv_show', ld });
+});
+let SM = { t: 0, x: '' };
+app.get('/sitemap.xml', wrap(async (req, res) => {
+  if (Date.now() - SM.t > 36e5) {
+    const b = baseUrl(req), list = await Movie.find({}, 'title updatedAt').sort({ updatedAt: -1 }).limit(50000);
+    SM = { t: Date.now(), x: `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n<url><loc>${b}/</loc></url>\n` + list.map(m => `<url><loc>${b}/m/${m.id}/${slug(m.title)}</loc><lastmod>${(m.updatedAt || new Date()).toISOString().slice(0, 10)}</lastmod></url>`).join('\n') + '\n</urlset>' };
+  }
+  res.type('application/xml').send(SM.x);
+}));
+app.get('/robots.txt', (req, res) => res.type('text/plain').send(`User-agent: *\nAllow: /\nDisallow: /api/\nDisallow: /dl/\nSitemap: ${baseUrl(req)}/sitemap.xml\n`));
+app.get('*', (req, res) => sendPage(req, res, { title: 'SHAGGY MOVIES – Download Movies, TV Series & Anime with Sinhala Subtitles', desc: 'Download the latest movies, TV series and anime with Sinhala subtitles in 480p, 720p and 1080p. Fast, simple and free.', path: '/' }));
 app.listen(E.PORT || 3000, () => console.log('SHAGGY MOVIES running'));
 
 // ---------- Telegram admin bot ----------
@@ -262,8 +342,8 @@ const clean = t => String(t || '').replace(/\s*Sinhala Subtitles.*$/i, '').repla
 const say = (chat, text, kb) => tg('sendMessage', { chat_id: chat, text, parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: kb ? { inline_keyboard: kb } : undefined });
 const show = (c, text, kb) => c.mid ? tg('editMessageText', { chat_id: c.chat, message_id: c.mid, text, parse_mode: 'HTML', reply_markup: { inline_keyboard: kb || [] } }) : say(c.chat, text, kb);
 const BACK = [{ text: '« Menu', callback_data: 'menu' }];
-const MENU = [[{ text: '🔍 Search & add', callback_data: 's' }], [{ text: '🎬 Movies', callback_data: 'l:movie:0' }, { text: '📺 TV series', callback_data: 'l:tv:0' }], [{ text: '🎌 Anime', callback_data: 'l:anime:0' }, { text: '🎌 Search anime', callback_data: 'sa' }], [{ text: '⭐ Featured', callback_data: 'l:feat:0' }, { text: '📊 Stats', callback_data: 'st' }], [{ text: '🔒 Log out', callback_data: 'out' }]];
-const HOME = '🎬 <b>SHAGGY MOVIES admin</b>\nSend a movie or series name to search and add it.\n\n<b>Commands</b>\n/bulk word : add every result of a search\n/bulkall : add as many movies as possible\n/links : save download links for all movies\n/anime name : search anime\n/stop : stop a running job';
+const MENU = [[{ text: '🔍 Search & add', callback_data: 's' }], [{ text: '🎬 Movies', callback_data: 'l:movie:0' }, { text: '📺 TV series', callback_data: 'l:tv:0' }], [{ text: '🎌 Anime', callback_data: 'l:anime:0' }, { text: '🎌 Search anime', callback_data: 'sa' }], [{ text: '🇱🇰 Search SinhalaSub', callback_data: 'sx' }], [{ text: '⭐ Featured', callback_data: 'l:feat:0' }, { text: '📊 Stats', callback_data: 'st' }], [{ text: '🔒 Log out', callback_data: 'out' }]];
+const HOME = '🎬 <b>SHAGGY MOVIES admin</b>\nSend a movie or series name to search and add it.\n\n<b>Commands</b>\n/bulk word : add every result of a search\n/bulkall : add everything from all 3 sources (or /bulkall anime)\n/links : save download links for all movies\n/anime name : search anime\n/ss name : search SinhalaSub\n/go 100,ANIME : add 100 new titles (CINESUBZ, SINHALASUB or ANIME)\n/stop : stop a running job';
 const q4 = t => t === 'tv' ? { type: 'tv' } : t === 'anime' ? { type: 'anime' } : t === 'feat' ? { featured: true } : { type: { $nin: ['tv', 'anime'] } };
 
 async function searchAll(q, page = 1) { // laksidu first; chamindu only if laksidu fails
@@ -280,11 +360,11 @@ async function searchAnime(q) { // paid API: only used when you ask for anime
   const d = await ch('/search', { q }, CHA);
   return d.map(x => ({ title: x.title, link: x.link, type: 'anime' })).filter(x => x.link);
 }
-async function doSearch(chat, s, q, anime = false) {
+async function doSearch(chat, s, q, src = 'cine') {
   tg('sendChatAction', { chat_id: chat, action: 'typing' });
   const w = await say(chat, `🔍 Searching <b>${H(q)}</b>…`), c = { chat, mid: w.result?.message_id };
   try {
-    const r = (await (anime ? searchAnime(q) : searchAll(q))).slice(0, 10); s.res = r; s.q = q;
+    const r = (await ({ anime: searchAnime, ss: searchSS, cine: searchAll }[src] || searchAll)(q)).slice(0, 10); s.res = r; s.q = q;
     if (!r.length) return show(c, 'No results. Try another spelling, for example <code>salaar</code>.', [BACK]);
     const have = new Set((await Movie.find({ sourceUrl: { $in: r.map(x => x.link) } }, 'sourceUrl')).map(x => x.sourceUrl));
     s.kb = [...r.map((x, i) => [{ text: `${have.has(x.link) ? '✓ ' : ''}${x.type === 'tv' ? '📺' : x.type === 'anime' ? '🎌' : '🎬'} ${clean(x.title).slice(0, 46)}`, callback_data: 'a:' + i }]), BACK];
@@ -308,6 +388,7 @@ async function act(c, s, d) {
   const [k, a, b] = d.split(':');
   if (k === 'menu') { s.mode = ''; return show(c, HOME, MENU); }
   if (k === 'stop') { JOB.stop = true; return show(c, '🛑 Stopping after the current step…'); }
+  if (k === 'sx') { s.mode = 'ss'; return show(c, '🇱🇰 Send the movie name (SinhalaSub).', [BACK]); }
   if (k === 'sa') { s.mode = 'anime'; return show(c, '🎌 Send the anime name.', [BACK]); }
   if (k === 's') { s.mode = ''; return show(c, '🔍 Send the movie or series name.', [BACK]); }
   if (k === 'st') {
@@ -337,6 +418,15 @@ const JOB = { run: false, stop: false };
 const STOPKB = [[{ text: '🛑 Stop', callback_data: 'stop' }]];
 const ALLKW = [...Array.from({ length: 47 }, (_, i) => String(2026 - i)), ...'abcdefghijklmnopqrstuvwxyz0123456789'.split(''),
   'action', 'comedy', 'horror', 'thriller', 'drama', 'romance', 'animation', 'crime', 'war', 'adventure', 'fantasy', 'family', 'mystery', 'korean', 'hindi', 'tamil', 'anime', 'sinhala', 'complete'];
+const ANIMEKW = [...'abcdefghijklmnopqrstuvwxyz'.split(''), 'naruto', 'one piece', 'dragon ball', 'solo leveling', 'attack on titan', 'demon slayer', 'jujutsu', 'bleach', 'hunter', 'boruto', 'hero academia', 'tokyo', 'sword art', 'death note', 'season 2', 'season 3', 'movie', 'ova'];
+const norm = t => clean(t).toLowerCase().replace(/[^a-z0-9\u0d80-\u0dff]+/g, '');
+async function searchSS(q, page = 1) { // SinhalaSub (movies only)
+  if (page > 1) return [];
+  const d = await ch('/search', { q }, SS);
+  return d.map(x => ({ title: x.title, link: x.link, type: x.type === 'tvshows' || /\/tvshows\//.test(x.link) ? 'tv' : 'movie' })).filter(x => x.link && x.type === 'movie');
+}
+const SRC = { CINESUBZ: { find: searchAll, kw: ALLKW }, SINHALASUB: { find: searchSS, kw: ALLKW }, ANIME: { find: (q, p) => p > 1 ? [] : searchAnime(q), kw: ANIMEKW } };
+const SRC_ALIAS = { CINE: 'CINESUBZ', CINESUBZ: 'CINESUBZ', SS: 'SINHALASUB', SINHALA: 'SINHALASUB', SINHALASUB: 'SINHALASUB', ANIME: 'ANIME' };
 
 // save download links for every movie that has none yet
 async function backfill(chat) {
@@ -356,30 +446,39 @@ async function backfill(chat) {
     if (chat) say(chat, `✅ Links finished${JOB.stop ? ' (stopped)' : ''}\nSaved: ${ok}\nNo links found: ${bad}`);
   } finally { JOB.run = false; }
 }
-// add many titles from cinesubz by running many searches (3 at a time)
-async function bulk(chat, keywords) {
+// add many NEW titles. plan = [{ name, find, kw }], limit = how many new titles to add (titles already on the site are skipped)
+async function bulk(chat, plan, limit = Infinity) {
   if (JOB.run) return say(chat, '⏳ Another job is running. Send /stop to cancel it.');
   JOB.run = true; JOB.stop = false;
-  const w = await say(chat, '📥 Bulk add started…', STOPKB), c = { chat, mid: w.result?.message_id };
-  const seen = new Set(); let added = 0, bad = 0, last = 0, done = 0;
-  const tick = () => { if (Date.now() - last > 4000) { last = Date.now(); show(c, `📥 Bulk adding…\n🔎 Searches: ${done}/${keywords.length}\n✅ Added: ${added}\n⚠️ Failed: ${bad}`, STOPKB); } };
+  const w = await say(chat, '📥 Starting…', STOPKB), c = { chat, mid: w.result?.message_id };
+  let added = 0, bad = 0, last = 0, done = 0, cur = plan[0]?.name;
+  const total = plan.reduce((a, p) => a + p.kw.length, 0);
+  const tick = () => { if (Date.now() - last > 4000) { last = Date.now(); show(c, `📥 Adding from <b>${cur}</b>…\n🔎 Searches: ${done}/${total}\n✅ Added: ${added}${limit < Infinity ? ' / ' + limit : ''}\n⚠️ Failed: ${bad}`, STOPKB); } };
   try {
-    for (const kw of keywords) {
-      for (let p = 1; p <= 5 && !JOB.stop; p++) {
-        let res; try { res = await searchAll(kw, p); } catch { break; }
-        const fresh = res.filter(x => !seen.has(x.link)); fresh.forEach(x => seen.add(x.link));
-        if (!fresh.length) break;
-        const have = new Set((await Movie.find({ sourceUrl: { $in: fresh.map(x => x.link) } }, 'sourceUrl')).map(x => x.sourceUrl));
-        const todo = fresh.filter(x => !have.has(x.link));
-        for (let i = 0; i < todo.length && !JOB.stop; i += 3) {
-          const r = await Promise.allSettled(todo.slice(i, i + 3).map(async x => { const v = await save(await build(x.link)); getPoster(v._id).catch(() => {}); }));
-          r.forEach(x => x.status === 'fulfilled' ? added++ : bad++); tick();
+    const have = new Set((await Movie.find({}, 'title sourceUrl')).flatMap(m => [norm(m.title), m.sourceUrl]));
+    for (const src of plan) {
+      cur = src.name;
+      for (const kw of src.kw) {
+        if (JOB.stop || added >= limit) break;
+        const seen = new Set();
+        for (let p = 1; p <= 5 && !JOB.stop && added < limit; p++) {
+          let res; try { res = await src.find(kw, p); } catch { break; }
+          const fresh = res.filter(x => !seen.has(x.link)); fresh.forEach(x => seen.add(x.link));
+          if (!fresh.length) break;
+          const todo = fresh.filter(x => !have.has(x.link) && !have.has(norm(x.title)));
+          todo.forEach(x => { have.add(x.link); have.add(norm(x.title)); });
+          for (let i = 0; i < todo.length && !JOB.stop && added < limit; i += 3) {
+            const r = await Promise.allSettled(todo.slice(i, i + Math.min(3, limit - added)).map(async x => { const v = await save(await build(x.link)); getPoster(v._id).catch(() => {}); }));
+            r.forEach(x => x.status === 'fulfilled' ? added++ : bad++); tick();
+          }
         }
+        done++; tick();
       }
-      done++; tick(); if (JOB.stop) break;
+      done = plan.slice(0, plan.indexOf(src) + 1).reduce((a, p) => a + p.kw.length, 0);
+      if (JOB.stop || added >= limit) break;
     }
   } finally { JOB.run = false; }
-  say(chat, `✅ Bulk finished${JOB.stop ? ' (stopped)' : ''}\nAdded: ${added}\nFailed: ${bad}`);
+  say(chat, `✅ Finished${JOB.stop ? ' (stopped)' : ''}\nAdded: ${added}\nFailed: ${bad}`);
 }
 async function handle(u) {
   const cb = u.callback_query, msg = u.message, from = (cb || msg)?.from; if (!from) return;
@@ -403,20 +502,36 @@ async function handle(u) {
   if (cb) { tg('answerCallbackQuery', { callback_query_id: cb.id }); return act({ chat, mid: cb.message.message_id }, s, cb.data).catch(e => say(chat, '⚠️ ' + H(e.message))); }
   if (/^\/stop\b/.test(text)) { JOB.stop = true; return say(chat, '🛑 Stopping after the current step…'); }
   if (/^\/links\b/.test(text)) return backfill(chat).catch(e => say(chat, '⚠️ ' + H(e.message)));
-  if (/^\/bulkall\b/.test(text)) return bulk(chat, ALLKW).catch(e => say(chat, '⚠️ ' + H(e.message)));
-  if (/^\/bulk\b/.test(text)) { const w = text.replace(/^\/bulk\s*/, '').trim(); return w ? bulk(chat, [w]).catch(e => say(chat, '⚠️ ' + H(e.message))) : say(chat, 'Use: <code>/bulk avatar</code>'); }
+  if (/^\/go\b/.test(text)) {
+    const g = text.match(/^\/go\s+(\d+)\s*[, ]\s*([a-z]+)/i), key = g && SRC_ALIAS[g[2].toUpperCase()];
+    if (!g || !key || +g[1] < 1) return say(chat, 'Use: <code>/go 100,ANIME</code>\nSources: CINESUBZ, SINHALASUB, ANIME');
+    return bulk(chat, [{ name: key, ...SRC[key] }], +g[1]).catch(e => say(chat, '⚠️ ' + H(e.message)));
+  }
+  if (/^\/bulkall\b/.test(text)) {
+    const k = SRC_ALIAS[(text.split(/\s+/)[1] || '').toUpperCase()];
+    return bulk(chat, (k ? [k] : Object.keys(SRC)).map(n => ({ name: n, ...SRC[n] }))).catch(e => say(chat, '⚠️ ' + H(e.message)));
+  }
+  if (/^\/bulk\b/.test(text)) {
+    const w = text.replace(/^\/bulk\s*/, '').trim();
+    return w ? bulk(chat, ['CINESUBZ', 'SINHALASUB'].map(n => ({ name: n, find: SRC[n].find, kw: [w] }))).catch(e => say(chat, '⚠️ ' + H(e.message))) : say(chat, 'Use: <code>/bulk avatar</code>');
+  }
+  if (/^\/ss\b/.test(text)) {
+    const w = text.replace(/^\/ss\s*/, '').trim();
+    if (!w) { s.mode = 'ss'; return say(chat, '🇱🇰 Send the movie name (SinhalaSub).'); }
+    return doSearch(chat, s, w, 'ss').catch(e => say(chat, '⚠️ ' + H(e.message)));
+  }
   if (/^\/(start|menu)\b/.test(text)) return act({ chat }, s, 'menu');
   if (/^\/anime\b/.test(text)) {
     const w = text.replace(/^\/anime\s*/, '').trim();
     if (!w) { s.mode = 'anime'; return say(chat, '🎌 Send the anime name.'); }
-    return doSearch(chat, s, w, true).catch(e => say(chat, '⚠️ ' + H(e.message)));
+    return doSearch(chat, s, w, 'anime').catch(e => say(chat, '⚠️ ' + H(e.message)));
   }
-  if (text && !text.startsWith('/')) { const an = s.mode === 'anime'; s.mode = ''; return doSearch(chat, s, text, an).catch(e => say(chat, '⚠️ ' + H(e.message))); }
+  if (text && !text.startsWith('/')) { const md = s.mode || 'cine'; s.mode = ''; return doSearch(chat, s, text, md).catch(e => say(chat, '⚠️ ' + H(e.message))); }
 }
 async function poll() {
   if (!E.TG_BOT_TOKEN) return console.log('Telegram bot off (no TG_BOT_TOKEN)');
   await tg('deleteWebhook');
-  tg('setMyCommands', { commands: [{ command: 'menu', description: 'Open menu' }, { command: 'login', description: 'Unlock with PIN' }, { command: 'bulk', description: 'Add all results of a search' }, { command: 'bulkall', description: 'Add as many movies as possible' }, { command: 'links', description: 'Save links for all movies' }, { command: 'anime', description: 'Search and add anime' }, { command: 'stop', description: 'Stop running job' }] }); console.log('Telegram bot running'); let off = 0;
+  tg('setMyCommands', { commands: [{ command: 'menu', description: 'Open menu' }, { command: 'login', description: 'Unlock with PIN' }, { command: 'bulk', description: 'Add all results of a search' }, { command: 'bulkall', description: 'Add as many movies as possible' }, { command: 'links', description: 'Save links for all movies' }, { command: 'anime', description: 'Search and add anime' }, { command: 'ss', description: 'Search SinhalaSub' }, { command: 'go', description: 'Add N new titles, e.g. /go 100,ANIME' }, { command: 'stop', description: 'Stop running job' }] }); console.log('Telegram bot running'); let off = 0;
   for (;;) {
     const r = await tg('getUpdates', { offset: off, timeout: 30, allowed_updates: ['message', 'callback_query'] });
     if (!r.ok) { await new Promise(x => setTimeout(x, 5000)); continue; }

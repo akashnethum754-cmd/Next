@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8">
+<meta name="referrer" content="no-referrer">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SHAGGY MOVIES</title>
 <link href="https://fonts.googleapis.com/css2?family=Oswald:wght@500;700&family=DM+Sans:wght@400;500;700&display=swap" rel="stylesheet">
@@ -90,6 +91,7 @@ async function buildMenu(){
   const grp=(i,t,subs)=>`<button class="mi" onclick="tgl(this)">${i} ${esc(t)}<span class="tg">+</span></button><div class="sub">${subs.map(([n,f])=>`<button onclick="go(${reg(f,t+' · '+n)})">${esc(n)}</button>`).join('')}</div>`;
   $('#dm').innerHTML=item('🏠','Latest',{})+item('🎬','All Movies',{type:'movie'})
    +grp('📺','TV Shows',[['All',{type:'tv'}],['Complete',{type:'tv',status:'complete'}],['Incomplete',{type:'tv',status:'incomplete'}]])
+   +item('🎌','Anime',{type:'anime'})
    +(gen.length?grp('🎭','Genres',gen.map(g=>[g,{genre:g}])):'')+item('⭐','Featured',{featured:1});
 }
 function tgl(b){const s=b.nextElementSibling;s.classList.toggle('on');b.querySelector('.tg').textContent=s.classList.contains('on')?'−':'+'}
@@ -98,14 +100,16 @@ $('#mb').onclick=()=>menu(true);$('#cl').onclick=$('#ov').onclick=()=>menu(false
 $('#sb').onclick=()=>{$('#sr').classList.toggle('on');if($('#sr').classList.contains('on'))$('#q').focus()};
 function go(i){const a=ACT[i];F=a.f;title=a.t;query='';$('#q').value='';menu(false);scrollTo(0,0);load()}
 // ---- listing ----
-const card=m=>`<div class="card" tabindex="0" onclick="openMovie('${m._id}')" onkeydown="if(event.key==='Enter')openMovie('${m._id}')">${m.type==='tv'?'<i class="bd">TV</i>':''}<img loading="lazy" decoding="async" src="/img/${m._id}" alt="${esc(ct(m.title))}"><b>${esc(ct(m.title))}</b><span>${esc(m.year)} <i class="star">★</i> ${esc(m.rating||'–')}</span></div>`;
+function imgFix(i){i.onerror=null;if(i.dataset.o)i.src=i.dataset.o}
+const card=m=>`<div class="card" tabindex="0" onclick="openMovie('${m._id}')" onkeydown="if(event.key==='Enter')openMovie('${m._id}')">${m.type==='tv'?'<i class="bd">TV</i>':m.type==='anime'?'<i class="bd">ANIME</i>':''}<img loading="lazy" decoding="async" src="/img/${m._id}" data-o="${esc(m.poster)}" onerror="imgFix(this)" alt="${esc(ct(m.title))}"><b>${esc(ct(m.title))}</b><span>${esc(m.year)} <i class="star">★</i> ${esc(m.rating||'–')}</span></div>`;
 async function load(reset=true){
   if(reset){page=1;$('#grid').innerHTML=''}
   try{
     const d=await api('/movies?'+new URLSearchParams({...F,q:query,page}));pages=d.pages;
     if(reset){
-      const h=!query&&!Object.keys(F).length?d.items.find(x=>x.type!=='tv'&&x.poster):null;
+      const h=!query&&!Object.keys(F).length?d.items.find(x=>x.type!=='tv'&&x.type!=='anime'&&x.poster):null;
       $('#hero').innerHTML=h?`<div class="hero" style="background-image:url('/img/${h._id}')"><div><h1>${esc(ct(h.title))}</h1><p>${esc(h.overview)}</p><button class="btn" onclick="openMovie('${h._id}')">Watch &amp; download</button></div></div>`:'';
+      if(h){const im=new Image();im.onerror=()=>{const el=$('.hero');if(el)el.style.backgroundImage=`url('${h.poster}')`};im.src='/img/'+h._id}
       $('#ttl').textContent=query?`Results for "${query}"`:title;
       if(!d.items.length)$('#grid').innerHTML='<p class="empty" style="grid-column:1/-1">Nothing here yet.</p>';
     }
@@ -146,6 +150,8 @@ async function loadLinks(id,quiet,data){
 async function rl(id,b){const o=b.textContent;b.disabled=true;b.textContent='Refreshing…';
   try{const r=await fetch('/api/links/'+id+'/refresh',{method:'POST'}),j=await r.json();if(!r.ok)throw new Error(j.error||'Failed');loadLinks(id,true,j)}
   catch(e){alert(e.message);b.disabled=false;b.textContent=o}}
+function animeHtml(m){const e=m.episodes||[];if(!e.length)return '<p class="meta" style="margin-top:12px">Episodes coming soon.</p>';
+  return `<div style="margin-top:14px">${e.map((x,i)=>`<div class="row"><div class="t">Episode ${esc(x.number)} · ${esc(x.title)}</div><a class="btn sm" href="/dl/anime/${m._id}/${i}">Download</a></div>`).join('')}</div>`}
 let OV={};
 function rm(b){const f=b.dataset.f==='1';$('#ovt').textContent=f?OV.short:OV.full;b.dataset.f=f?'0':'1';b.textContent=f?'Read more':'Show less'}
 async function openMovie(id){
@@ -154,12 +160,12 @@ async function openMovie(id){
     const m=await api('/movies/'+id),meta=(k,l)=>m[k]?`<p class="meta"><b>${l}:</b> ${esc(m[k])}</p>`:'';
     m.country=[...new Set(String(m.country||'').split(',').map(x=>x.trim()).filter(Boolean))].join(', ');
     const ov=(m.overview||'').trim(),short=ov.length>230?ov.slice(0,230).replace(/\s+\S*$/,'')+'…':ov;OV={full:ov,short};
-    show(`<div class="det"><img src="/img/${m._id}" alt=""><div class="in"><h3>${esc(ct(m.title))}</h3>
-    <div class="meta">${[m.year,m.runtime,m.type==='tv'?'TV series':'Movie',m.rating?'★ '+m.rating:''].filter(Boolean).map(esc).join(' · ')}</div>
+    show(`<div class="det"><img src="/img/${m._id}" data-o="${esc(m.poster)}" onerror="imgFix(this)" alt=""><div class="in"><h3>${esc(ct(m.title))}</h3>
+    <div class="meta">${[m.year,m.runtime,({tv:'TV series',anime:'Anime'})[m.type]||'Movie',m.rating?'★ '+m.rating:''].filter(Boolean).map(esc).join(' · ')}</div>
     <div class="tags">${(m.genres||[]).filter(g=>!/^[#.]/.test(g)).map(g=>`<span>${esc(g)}</span>`).join('')}</div><p style="margin:8px 0" id="ovt">${esc(short)}</p>${ov.length>230?'<button class="btn alt sm" data-f="0" onclick="rm(this)" style="margin-bottom:8px">Read more</button>':''}${m.cast?.length?`<p class="meta"><b>Cast:</b> ${m.cast.map(esc).join(', ')}</p>`:''}${meta('director','Director')}${meta('country','Country')}
-    ${m.type==='tv'?tvHtml(m):'<div class="dl" id="dls"><span class="meta">Getting download links… the first time can take a few seconds.</span></div>'}</div></div>`);
+    ${m.type==='tv'?tvHtml(m):m.type==='anime'?animeHtml(m):'<div class="dl" id="dls"><span class="meta">Getting download links… the first time can take a few seconds.</span></div>'}</div></div>`);
     if(m.type==='tv'&&$('#ss'))eps();
-    if(m.type!=='tv')loadLinks(id);
+    if(m.type!=='tv'&&m.type!=='anime')loadLinks(id);
   }catch(e){show(`<p class="empty">${esc(e.message)}</p>`)}
 }
 buildMenu();load();

@@ -18,23 +18,33 @@ const MovieSchema = new mongoose.Schema({
 const PosterSchema = new mongoose.Schema({ movie: { type: mongoose.Schema.Types.ObjectId, unique: true }, type: String, data: Buffer });
 const URIS = [E.MONGODB_URI, ...(E.MONGODB_URIS || '').split(','), ...Array.from({ length: 8 }, (_, i) => E['MONGODB_URI_' + (i + 2)])].map(x => (x || '').trim()).filter((x, i, a) => x && a.indexOf(x) === i);
 if (!URIS.length) { console.error('MONGODB_URI is missing'); URIS.push('mongodb://127.0.0.1:27017/shaggy'); }
-const SH = URIS.map((uri, i) => {
-  const conn = i === 0 ? mongoose.connection : mongoose.createConnection(uri);
-  (i === 0 ? mongoose.connect(uri) : conn.asPromise()).then(() => console.log(`MongoDB ${i + 1} connected`)).catch(e => console.error(`MongoDB ${i + 1} error:`, e.message));
-  return { i, name: 'DB' + (i + 1), conn, Movie: conn.model('Movie', MovieSchema), Poster: conn.model('Poster', PosterSchema), full: false, mb: 0 };
+const fixUri = u => u.replace(/:<([^>@]*)>@/, ':$1@').replace(/(mongodb(?:\+srv)?:\/\/[^/?]+)\/?(\?|$)/, '$1/shaggy$2'); // removes < > around the password, adds a database name if missing
+const OPTS = { serverSelectionTimeoutMS: 8000, connectTimeoutMS: 8000 };
+const SH = URIS.map((raw, i) => {
+  const uri = fixUri(raw), conn = i === 0 ? mongoose.connection : mongoose.createConnection();
+  const sh = { i, name: 'DB' + (i + 1), conn, Movie: conn.model('Movie', MovieSchema), Poster: conn.model('Poster', PosterSchema), full: false, mb: 0, err: '' };
+  (async () => { // keeps trying every 30 s until connected
+    for (;;) {
+      try { await (i === 0 ? mongoose.connect(uri, OPTS) : conn.openUri(uri, OPTS)); sh.err = ''; console.log(`MongoDB ${i + 1} connected`); return; }
+      catch (e) { sh.err = e.message; console.error(`MongoDB ${i + 1} error:`, e.message); await new Promise(r => setTimeout(r, 30000)); }
+    }
+  })();
+  return sh;
 });
+const live = () => SH.filter(x => x.conn.readyState === 1); // databases that are connected right now
 const QUOTA = e => /quota/i.test(String(e?.message || e));
 async function dbSize() {
   const out = [];
   for (const sh of SH) {
+    if (sh.conn.readyState !== 1) { out.push({ name: sh.name, mb: null, down: true }); continue; }
     try { const st = await sh.conn.db.stats(); sh.mb = Math.round((st.storageSize + st.indexSize) / 1048576); sh.full = sh.mb > LIMIT * KEEP; out.push({ name: sh.name, mb: sh.mb }); }
     catch { out.push({ name: sh.name, mb: null }); }
   }
   return out;
 }
-const dbLine = a => a.map(x => `${x.name} ${x.mb ?? '?'}/${LIMIT} MB`).join(' · ');
-const allFull = () => SH.every(s => s.full);
-const dropPosters = async () => { let n = 0; for (const sh of SH) { try { await sh.conn.collection('posters').drop(); n++; } catch {} } return n > 0; };
+const dbLine = a => a.map(x => x.down ? `${x.name} ❌ offline` : `${x.name} ${x.mb ?? '?'}/${LIMIT} MB`).join(' · ');
+const allFull = () => !live().some(x => !x.full);
+const dropPosters = async () => { let n = 0; for (const sh of live()) { try { await sh.conn.collection('posters').drop(); n++; } catch {} } return n > 0; };
 
 // Movie = one model over every database (same calls as a normal model, results are merged)
 const val = v => v instanceof Date ? v.getTime() : typeof v === 'boolean' ? +v : v ?? 0;
@@ -45,7 +55,7 @@ class Q {
   async run() {
     const { f, _sort: sort, _skip: skip, _limit: limit } = this; let proj = this.proj;
     if (sort && typeof proj === 'string' && proj && !/(^|\s)-/.test(proj)) proj += ' ' + Object.keys(sort).join(' ');
-    const rows = (await Promise.all(SH.map(sh => {
+    const rows = (await Promise.all(live().map(sh => {
       let q = sh.Movie.find(f, proj); if (sort) q = q.sort(sort); if (limit) q = q.limit(skip + limit); if (this._lean) q = q.lean(); return q;
     }))).flat();
     if (sort) rows.sort(cmpBy(sort));
@@ -57,15 +67,15 @@ class Q {
 const first = async list => { for (const r of await Promise.all(list)) if (r) return r; return null; };
 const Movie = {
   find: (f, proj) => new Q(f, proj),
-  findById: (id, proj) => /^[0-9a-f]{24}$/i.test(String(id)) ? first(SH.map(s => s.Movie.findById(id, proj))) : Promise.resolve(null),
-  findOne: (f, proj) => first(SH.map(s => s.Movie.findOne(f, proj))),
-  exists: f => first(SH.map(s => s.Movie.exists(f))),
-  async countDocuments(f) { return (await Promise.all(SH.map(s => s.Movie.countDocuments(f)))).reduce((a, b) => a + b, 0); },
-  async distinct(k, f) { return [...new Set((await Promise.all(SH.map(s => s.Movie.distinct(k, f)))).flat())]; },
-  async findByIdAndUpdate(id, u, o) { for (const s of SH) { const r = await s.Movie.findByIdAndUpdate(id, u, o); if (r) return r; } return null; },
-  async findByIdAndDelete(id) { for (const s of SH) { const r = await s.Movie.findByIdAndDelete(id); if (r) return r; } return null; },
-  async deleteMany(f) { let n = 0; for (const s of SH) n += (await s.Movie.deleteMany(f)).deletedCount || 0; return { deletedCount: n }; },
-  async updateMany(f, u) { let n = 0; for (const s of SH) n += (await s.Movie.updateMany(f, u)).modifiedCount || 0; return { modifiedCount: n }; },
+  findById: (id, proj) => /^[0-9a-f]{24}$/i.test(String(id)) ? first(live().map(s => s.Movie.findById(id, proj))) : Promise.resolve(null),
+  findOne: (f, proj) => first(live().map(s => s.Movie.findOne(f, proj))),
+  exists: f => first(live().map(s => s.Movie.exists(f))),
+  async countDocuments(f) { return (await Promise.all(live().map(s => s.Movie.countDocuments(f)))).reduce((a, b) => a + b, 0); },
+  async distinct(k, f) { return [...new Set((await Promise.all(live().map(s => s.Movie.distinct(k, f)))).flat())]; },
+  async findByIdAndUpdate(id, u, o) { for (const s of live()) { const r = await s.Movie.findByIdAndUpdate(id, u, o); if (r) return r; } return null; },
+  async findByIdAndDelete(id) { for (const s of live()) { const r = await s.Movie.findByIdAndDelete(id); if (r) return r; } return null; },
+  async deleteMany(f) { let n = 0; for (const s of live()) n += (await s.Movie.deleteMany(f)).deletedCount || 0; return { deletedCount: n }; },
+  async updateMany(f, u) { let n = 0; for (const s of live()) n += (await s.Movie.updateMany(f, u)).modifiedCount || 0; return { modifiedCount: n }; },
 };
 
 // ---- posters: saved in MongoDB as small WebP copies (about 20 KB each) and shown from our own site ----
@@ -78,12 +88,12 @@ async function shrink(buf) {
   return buf;
 }
 async function readPoster(id) {
-  for (const r of await Promise.all(SH.map(s => s.Poster.findOne({ movie: id }).catch(() => null)))) { const t = r && imgType(r.data); if (t) return { data: Buffer.from(r.data), type: t }; }
+  for (const r of await Promise.all(live().map(s => s.Poster.findOne({ movie: id }).catch(() => null)))) { const t = r && imgType(r.data); if (t) return { data: Buffer.from(r.data), type: t }; }
   return null;
 }
 async function storePoster(movieId, data, type) {
   if (!sharp && data.length > 90000) return false; // without the shrinker only small images are saved
-  for (const sh of SH.filter(s => !s.full)) {
+  for (const sh of live().filter(s => !s.full)) {
     try { await sh.Poster.findOneAndUpdate({ movie: movieId }, { type, data }, { upsert: true }); return true; }
     catch (e) { if (QUOTA(e)) sh.full = true; else return false; }
   }
@@ -97,13 +107,13 @@ async function fetchPoster(url) {
 }
 async function warmOne(m) { if (!m?.poster || await readPoster(m._id)) return false; const p = await fetchPoster(m.poster); return p ? storePoster(m._id, p.data, p.type) : false; }
 async function warmPosters() {
-  const have = new Set(); for (const sh of SH) for (const x of await sh.Poster.find({}, 'movie').catch(() => [])) have.add(String(x.movie));
+  const have = new Set(); for (const sh of live()) for (const x of await sh.Poster.find({}, 'movie').catch(() => [])) have.add(String(x.movie));
   const todo = (await Movie.find({}, 'poster')).filter(m => m.poster && !have.has(String(m._id)));
   let n = 0;
   for (let i = 0; i < todo.length && !allFull(); i += 3) n += (await Promise.allSettled(todo.slice(i, i + 3).map(warmOne))).filter(r => r.value).length;
   return n;
 }
-async function delPosters(ids) { for (const sh of SH) await sh.Poster.deleteMany({ movie: { $in: ids } }).catch(() => {}); }
+async function delPosters(ids) { for (const sh of live()) await sh.Poster.deleteMany({ movie: { $in: ids } }).catch(() => {}); }
 
 // short-lived cache in MongoDB (resolved links, episode lists, cooldowns) so the paid APIs are hit as little as possible
 const Cache = mongoose.model('Cache', new mongoose.Schema({ k: { type: String, unique: true }, v: String, at: { type: Date, default: Date.now, expires: 10800 } }));
@@ -171,12 +181,12 @@ const lakDetails = async link => (await cine('/cinesubz/details', { url: link })
 const nonEmpty = v => !(v == null || v === '' || (Array.isArray(v) && !v.length));
 const save = async doc => {
   const set = {}; for (const [k, v] of Object.entries(doc)) if (nonEmpty(v)) set[k] = v;
-  for (const sh of SH) { // already saved in any database? update it there
+  for (const sh of live()) { // already saved in any database? update it there
     let old; try { old = await sh.Movie.findOneAndUpdate({ sourceUrl: doc.sourceUrl }, { $set: set }, { new: true }); }
     catch (e) { if (QUOTA(e)) old = await sh.Movie.findOne({ sourceUrl: doc.sourceUrl }); else throw e; }
     if (old) return old;
   }
-  for (const sh of SH.filter(s => !s.full)) { // new title: first database with room
+  for (const sh of live().filter(s => !s.full)) { // new title: first database with room
     try { return await sh.Movie.create(set); } catch (e) { if (QUOTA(e)) { sh.full = true; continue; } throw e; }
   }
   throw new Error('all databases are over their space quota - add another MongoDB link (MONGODB_URI_2)');
@@ -455,7 +465,7 @@ const say = (chat, text, kb) => tg('sendMessage', { chat_id: chat, text, parse_m
 const show = (c, text, kb) => c.mid ? tg('editMessageText', { chat_id: c.chat, message_id: c.mid, text, parse_mode: 'HTML', reply_markup: { inline_keyboard: kb || [] } }) : say(c.chat, text, kb);
 const BACK = [{ text: '« Menu', callback_data: 'menu' }];
 const MENU = [[{ text: '🔍 Search & add', callback_data: 's' }], [{ text: '🎬 Movies', callback_data: 'l:movie:0' }, { text: '📺 TV series', callback_data: 'l:tv:0' }], [{ text: '🎌 Anime', callback_data: 'l:anime:0' }, { text: '🎌 Search anime', callback_data: 'sa' }], [{ text: '🇱🇰 Search SinhalaSub', callback_data: 'sx' }], [{ text: '⭐ Featured', callback_data: 'l:feat:0' }, { text: '📊 Stats', callback_data: 'st' }], [{ text: '🔒 Log out', callback_data: 'out' }]];
-const HOME = '🎬 <b>SHAGGY MOVIES admin</b>\nSend a movie or series name to search and add it.\n\n<b>Commands</b>\n/bulk word : add every result of a search\n/bulkall : add everything from all 3 sources (or /bulkall anime)\n/links : save download links for all movies\n/anime name : search anime\n/ss name : search SinhalaSub\n/go 100,ANIME : add 100 new titles (CINESUBZ, SINHALASUB or ANIME)\n/stats : numbers\n/recent : last 10 added\n/find word : search your library\n/missing : movies without links\n/dupes : duplicate titles\n/ads on|off : show or hide ads\n/freespace : drop saved posters (re-saved smaller)\n/posters : save missing posters in MongoDB\n/dedupe : remove duplicate titles\n/failed : failed adds   /retry : retry them\n/tv 100 : add 100 new TV series\n/blocklink name : hide a download server everywhere\n/clearcache : clear link caches\n/stop : stop a running job';
+const HOME = '🎬 <b>SHAGGY MOVIES admin</b>\nSend a movie or series name to search and add it.\n\n<b>Commands</b>\n/bulk word : add every result of a search\n/bulkall : add everything from all 3 sources (or /bulkall anime)\n/links : save download links for all movies\n/anime name : search anime\n/ss name : search SinhalaSub\n/go 100,ANIME : add 100 new titles (CINESUBZ, SINHALASUB or ANIME)\n/stats : numbers   /db : database status\n/recent : last 10 added\n/find word : search your library\n/missing : movies without links\n/dupes : duplicate titles\n/ads on|off : show or hide ads\n/freespace : drop saved posters (re-saved smaller)\n/posters : save missing posters in MongoDB\n/dedupe : remove duplicate titles\n/failed : failed adds   /retry : retry them\n/tv 100 : add 100 new TV series\n/blocklink name : hide a download server everywhere\n/clearcache : clear link caches\n/stop : stop a running job';
 const q4 = t => t === 'tv' ? { type: 'tv' } : t === 'anime' ? { type: 'anime' } : t === 'feat' ? { featured: true } : { type: { $nin: ['tv', 'anime'] } };
 
 async function searchAll(q, page = 1) { // laksidu first; chamindu only if laksidu fails
@@ -716,6 +726,10 @@ async function handle(u) {
   if (/^\/stop\b/.test(text)) { JOB.stop = true; return say(chat, '🛑 Stopping after the current step…'); }
   if (/^\/links\b/.test(text)) return backfill(chat).catch(e => say(chat, '⚠️ ' + H(e.message)));
   const row = m => [{ text: (m.type === 'tv' ? '📺 ' : m.type === 'anime' ? '🎌 ' : '🎬 ') + clean(m.title).slice(0, 46), callback_data: 'm:' + m._id }];
+  if (/^\/dbs?\b/.test(text)) {
+    const sz = await dbSize();
+    return say(chat, '🗄 <b>Databases</b>\n' + SH.map((x, i) => `${x.name}: ${x.conn.readyState === 1 ? `✅ connected · ${sz[i].mb ?? '?'}/${LIMIT} MB${x.full ? ' (full)' : ''}` : '❌ offline' + (x.err ? ' – ' + H(x.err.slice(0, 140)) : '')}`).join('\n') + '\n\nAdd more with MONGODB_URI_2, MONGODB_URI_3 …');
+  }
   if (/^\/stats\b/.test(text)) return act({ chat }, s, 'st').catch(e => say(chat, '⚠️ ' + H(e.message)));
   if (/^\/recent\b/.test(text)) return say(chat, '🆕 <b>Recently added</b>', [...(await Movie.find({}, 'title type').sort({ createdAt: -1 }).limit(10)).map(row), BACK]);
   if (/^\/find\b/.test(text)) {
@@ -801,7 +815,7 @@ async function handle(u) {
 async function poll() {
   if (!E.TG_BOT_TOKEN) return console.log('Telegram bot off (no TG_BOT_TOKEN)');
   await tg('deleteWebhook');
-  tg('setMyCommands', { commands: [{ command: 'menu', description: 'Open menu' }, { command: 'login', description: 'Unlock with PIN' }, { command: 'bulk', description: 'Add all results of a search' }, { command: 'bulkall', description: 'Add as many movies as possible' }, { command: 'links', description: 'Save links for all movies' }, { command: 'anime', description: 'Search and add anime' }, { command: 'ss', description: 'Search SinhalaSub' }, { command: 'go', description: 'Add N new titles, e.g. /go 100,ANIME' }, { command: 'stats', description: 'Site numbers' }, { command: 'recent', description: 'Last 10 added' }, { command: 'find', description: 'Search your library' }, { command: 'missing', description: 'Movies without links' }, { command: 'dupes', description: 'Duplicate titles' }, { command: 'ads', description: 'Ads on or off' }, { command: 'freespace', description: 'Free database space' }, { command: 'posters', description: 'Save posters in MongoDB' }, { command: 'dedupe', description: 'Remove duplicate titles' }, { command: 'tv', description: 'Add N new TV series' }, { command: 'failed', description: 'Failed adds' }, { command: 'retry', description: 'Retry failed adds' }, { command: 'blocklink', description: 'Hide a download server' }, { command: 'clearcache', description: 'Clear caches' }, { command: 'stop', description: 'Stop running job' }] }); console.log('Telegram bot running'); let off = 0;
+  tg('setMyCommands', { commands: [{ command: 'menu', description: 'Open menu' }, { command: 'login', description: 'Unlock with PIN' }, { command: 'bulk', description: 'Add all results of a search' }, { command: 'bulkall', description: 'Add as many movies as possible' }, { command: 'links', description: 'Save links for all movies' }, { command: 'anime', description: 'Search and add anime' }, { command: 'ss', description: 'Search SinhalaSub' }, { command: 'go', description: 'Add N new titles, e.g. /go 100,ANIME' }, { command: 'stats', description: 'Site numbers' }, { command: 'db', description: 'Database status' }, { command: 'recent', description: 'Last 10 added' }, { command: 'find', description: 'Search your library' }, { command: 'missing', description: 'Movies without links' }, { command: 'dupes', description: 'Duplicate titles' }, { command: 'ads', description: 'Ads on or off' }, { command: 'freespace', description: 'Free database space' }, { command: 'posters', description: 'Save posters in MongoDB' }, { command: 'dedupe', description: 'Remove duplicate titles' }, { command: 'tv', description: 'Add N new TV series' }, { command: 'failed', description: 'Failed adds' }, { command: 'retry', description: 'Retry failed adds' }, { command: 'blocklink', description: 'Hide a download server' }, { command: 'clearcache', description: 'Clear caches' }, { command: 'stop', description: 'Stop running job' }] }); console.log('Telegram bot running'); let off = 0;
   for (;;) {
     const r = await tg('getUpdates', { offset: off, timeout: 30, allowed_updates: ['message', 'callback_query'] });
     if (!r.ok) { await new Promise(x => setTimeout(x, 5000)); continue; }

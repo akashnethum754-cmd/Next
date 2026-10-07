@@ -80,6 +80,7 @@ footer b{font:700 18px Oswald;color:var(--txt);letter-spacing:1px;display:block;
 select.btn{appearance:none;padding-right:16px}
 .ad{grid-column:1/-1;display:flex;flex-direction:column;align-items:center;margin:16px 0;max-width:100%;overflow:hidden}.dt .ad{margin:28px 0}
 .ad small{color:var(--mute);font-size:10px;letter-spacing:1.2px;text-transform:uppercase;margin-bottom:4px}.ad iframe{border:0;max-width:100%;background:transparent}
+.nt{position:fixed;inset:0;z-index:90;background:rgba(0,0,0,.78);display:grid;place-items:center;padding:18px;animation:in .25s both}.ntb{max-width:420px;width:100%;background:var(--s1);border:1px solid var(--line);border-radius:16px;padding:16px;text-align:center;max-height:90vh;overflow:auto}.ntb img{width:100%;border-radius:12px;margin-bottom:12px;display:block}.ntb p{margin-bottom:14px;color:#e6dff0}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 </style></head><body>
 <header>
@@ -226,6 +227,11 @@ async function openMovie(id,push=true){
     if(m.type!=='tv'&&m.type!=='anime')loadLinks(id);
   }catch(e){pgShow(`<p class="empty">${esc(e.message)}</p>`)}
 }
-buildMenu();load();setMeta(document.title&&document.title!=='undefined'?document.title:'');
+async function showNotice(){
+  try{const n=(await api('/notice')).notice;if(!n)return;let seen='';try{seen=localStorage.getItem('sm_nt')||''}catch{}if(seen===n.id)return;
+    const t=esc(n.text||'').replace(/(https?:\/\/[^\s<]+)/g,'<a href="$1" target="_blank" rel="noopener" style="color:#a78bfa;text-decoration:underline">$1</a>').replace(/\n/g,'<br>');
+    const d=document.createElement('div');d.className='nt';d.innerHTML=`<div class="ntb">${n.img?`<img src="/api/notice/img?v=${esc(n.id)}" alt="">`:''}${t?`<p>${t}</p>`:''}<button class="btn" id="ntx">OK</button></div>`;
+    document.body.appendChild(d);const close=()=>{d.remove();try{localStorage.setItem('sm_nt',n.id)}catch{}};d.onclick=e=>{if(e.target===d)close()};$('#ntx').onclick=close}catch{}}
+buildMenu();load();setTimeout(showNotice,900);setMeta(document.title&&document.title!=='undefined'?document.title:'');
 {const id=idFromPath();if(id)openMovie(id,false)}
 </script></body></html>

@@ -86,7 +86,7 @@ const Movie = {
 const imgType = b => !b || b.length < 200 ? null : (b[0] === 0xFF && b[1] === 0xD8) ? 'image/jpeg' : (b[0] === 0x89 && b[1] === 0x50) ? 'image/png'
   : (b.slice(0, 4).toString() === 'RIFF' && b.slice(8, 12).toString() === 'WEBP') ? 'image/webp' : b.slice(0, 3).toString() === 'GIF' ? 'image/gif' : null;
 const IMGC = new Map(); // recently shown posters, kept in memory
-let sharp = null; try { sharp = require('sharp'); } catch {}
+let sharp = null; try { sharp = require('sharp'); sharp.cache({ memory: 32, files: 0, items: 40 }); sharp.concurrency(1); } catch {}
 async function shrink(buf, w = 480, q = 72) {
   if (sharp) { try { const out = await sharp(buf).resize({ width: w, withoutEnlargement: true }).webp({ quality: q }).toBuffer(); if (out.length < buf.length) return out; } catch {} }
   return buf;
@@ -172,7 +172,7 @@ async function ch(p, params, base = CH) {
 const linkCache = new Map(); // fallback answers kept 10 min in memory
 async function infodl(link) {
   const c = linkCache.get(link); if (c && Date.now() - c.t < 6e5) return c.d;
-  const d = await ch('/infodl', { q: link }); linkCache.set(link, { t: Date.now(), d }); return d;
+  const d = await ch('/infodl', { q: link }); linkCache.set(link, { t: Date.now(), d }); if (linkCache.size > 60) linkCache.delete(linkCache.keys().next().value); return d;
 }
 // cinesubz.* pages and Telegram links are not real downloads, so they are never shown
 const bad = u => { try { return /(^|\.)(cinesubz\.[a-z]+|t\.me|telegram\.me)$/i.test(new URL(u).hostname); } catch { return true; } };
@@ -248,7 +248,7 @@ const isAnime = l => /animeheaven\./i.test(l || '');
 const aCache = new Map();
 async function animeInfo(link) {
   const c = aCache.get(link); if (c && Date.now() - c.t < 12e5) return c.d;
-  const d = await ch('/info', { q: link }, CHA); aCache.set(link, { t: Date.now(), d }); return d;
+  const d = await ch('/info', { q: link }, CHA); aCache.set(link, { t: Date.now(), d }); if (aCache.size > 60) aCache.delete(aCache.keys().next().value); return d;
 }
 const animeList = d => d.episodes?.length ? d.episodes : d.downloads || [];
 async function buildAnime(link) {
@@ -380,7 +380,7 @@ app.get('/img/:id', async (req, res) => {
       if (!hit) return res.set('Referrer-Policy', 'no-referrer').redirect(m.poster);
       storePoster(m._id, hit.data, hit.type).catch(() => {});
     }
-    IMGC.set(id, hit); if (IMGC.size > 150) IMGC.delete(IMGC.keys().next().value);
+    IMGC.set(id, hit); if (IMGC.size > 80) IMGC.delete(IMGC.keys().next().value);
     res.set({ 'Content-Type': hit.type, 'Cache-Control': 'public, max-age=31536000, immutable' }).send(hit.data);
   } catch {
     const m = await Movie.findById(id, 'poster').catch(() => null);
@@ -743,14 +743,39 @@ const autoCfg = async () => { const x = await Setting.findOne({ k: 'auto' }).cat
 const setAuto = async p => { const v = { ...(await autoCfg()), ...p }; await Setting.findOneAndUpdate({ k: 'auto' }, { v: JSON.stringify(v) }, { upsert: true }); return v; };
 const aiOn = async () => { const x = await Setting.findOne({ k: 'ai' }).catch(() => null); return x ? x.v !== 'off' : !!E.GEMINI_API_KEY; };
 const notifyAdmins = t => IDS.forEach(id => say(id, t));
+// Gemini: the model is chosen automatically from what your API key can use (set GEMINI_MODEL only to force one).
+// If Google retires a model, the next call switches to the model Google suggests or the newest "flash" model.
+const GAPI = 'https://generativelanguage.googleapis.com/v1beta', GM = { name: '', t: 0, bad: new Set() };
+async function geminiModel(force) {
+  if (E.GEMINI_MODEL && !force) return E.GEMINI_MODEL;
+  if (GM.name && !force && Date.now() - GM.t < 6 * 36e5) return GM.name;
+  const r = await fetch(`${GAPI}/models?pageSize=200`, { headers: { 'x-goog-api-key': E.GEMINI_API_KEY }, signal: AbortSignal.timeout(20000) });
+  const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error?.message || 'Gemini HTTP ' + r.status);
+  const names = (j.models || []).filter(m => (m.supportedGenerationMethods || []).includes('generateContent')).map(m => m.name.replace(/^models\//, ''))
+    .filter(n => /^gemini/.test(n) && !/(image|tts|live|audio|embed|vision|robotics|computer|-exp)/i.test(n) && !GM.bad.has(n));
+  const rank = n => parseFloat((n.match(/^gemini-(\d+(?:\.\d+)?)/) || [])[1] || 0) * 100 + (/flash/.test(n) ? 150 : /pro/.test(n) ? 5 : 0) - (/lite/.test(n) ? 8 : 0) - (/preview/.test(n) ? 3 : 0);
+  const pick = names.sort((x, y) => rank(y) - rank(x))[0];
+  if (!pick) throw new Error('no Gemini model is available for this API key');
+  GM.name = pick; GM.t = Date.now(); return pick;
+}
 async function gemini(prompt) {
   if (!E.GEMINI_API_KEY) return null;
-  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${E.GEMINI_MODEL || 'gemini-2.5-flash'}:generateContent`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': E.GEMINI_API_KEY }, signal: AbortSignal.timeout(40000),
-    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.2, maxOutputTokens: 1000 } })
-  });
-  const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error?.message || 'Gemini HTTP ' + r.status);
-  return (j.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('').trim() || null;
+  let model = await geminiModel();
+  for (let tries = 0; tries < 3; tries++) {
+    const r = await fetch(`${GAPI}/models/${model}:generateContent`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': E.GEMINI_API_KEY }, signal: AbortSignal.timeout(40000),
+      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.2, maxOutputTokens: 1000 } })
+    });
+    const j = await r.json().catch(() => ({})), msg = j.error?.message || 'Gemini HTTP ' + r.status;
+    if (r.ok) { GM.name = model; return (j.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('').trim() || null; }
+    if (r.status === 404 || /no longer available|not found|not supported|deprecated|retired/i.test(msg)) { // retired model: use the suggested one, or look for another
+      GM.bad.add(model);
+      const hint = [...msg.matchAll(/models\/(gemini[\w.\-]*)/g)].map(m => m[1]).filter(n => n !== model && !GM.bad.has(n)).pop();
+      model = hint || await geminiModel(true); GM.name = model; GM.t = Date.now(); continue;
+    }
+    throw new Error(msg);
+  }
+  throw new Error('no working Gemini model found');
 }
 async function scanSite() {
   const R = { at: new Date().toISOString(), issues: [], checks: {}, fix: { deadMovies: [] } }, flag = m => R.issues.push(m), base = `http://127.0.0.1:${E.PORT || 3000}`;
@@ -780,7 +805,7 @@ async function scanSite() {
   try { const d = await cine('/cinesubz/search', { query: 'avatar' }, 1); if (!(d.results || []).length) flag('main search API returned nothing'); } catch (e) { flag('main API (laksidu): ' + e.message); }
   const rec = ERRS.filter(e => Date.now() - e.t < 36e5); R.recentErrors = [...new Set(rec.map(e => e.m))].slice(-8);
   if (rec.length) flag(`${rec.length} server errors in the last hour`);
-  R.checks.memoryMB = Math.round(process.memoryUsage().rss / 1048576); if (R.checks.memoryMB > 450) flag(`high memory use (${R.checks.memoryMB} MB)`);
+  R.checks.memoryMB = Math.round(process.memoryUsage().rss / 1048576); if (R.checks.memoryMB > (+E.MEM_LIMIT_MB || 512) * 0.9) flag(`high memory use (${R.checks.memoryMB} MB)`);
   return R;
 }
 async function fixLinks(limit = 30) { // safe repair: fetch links for movies that have none (main API only)
@@ -798,10 +823,10 @@ async function runDoctor() {
     let n = 0; for (const id of R.fix.deadMovies.slice(0, 5)) { const m = await Movie.findById(id, 'sourceUrl'); if (m && !isSS(m.sourceUrl) && !(await cget('cool:' + m.id))) { await cset('cool:' + m.id, 1); await freshLinks(m); n++; } }
     if (n) fixed.deadLinkSetsRefreshed = n;
   } catch (e) { console.error('autofix:', e.message); }
-  let ai = null; try { ai = await gemini(DOCTOR + JSON.stringify({ ...R, fix: undefined, autoFixed: fixed })); } catch (e) { R.issues.push('Gemini: ' + e.message); }
+  let ai = null, aiErr = ''; try { ai = await gemini(DOCTOR + JSON.stringify({ ...R, fix: undefined, autoFixed: fixed })); } catch (e) { aiErr = e.message; console.error('gemini:', e.message); }
   const lines = Object.entries(R.checks).map(([k, v]) => `${k}: ${v}`).join('\n');
   const problems = R.issues.length > 0 && !(ai && /^✅\s*OK/.test(ai));
-  const text = `🩺 <b>Site doctor</b>${problems ? ' ⚠️' : ' ✅'}\n${H(lines)}\n\n${ai ? H(ai.slice(0, 2500)) : R.issues.length ? R.issues.map(i => '• ' + H(i)).join('\n') : 'Everything looks fine.'}${Object.keys(fixed).length ? '\n\n🔧 Auto-fixed: ' + H(JSON.stringify(fixed)) : ''}${E.GEMINI_API_KEY ? '' : '\n\nℹ️ Add GEMINI_API_KEY for AI explanations.'}`;
+  const text = `🩺 <b>Site doctor</b>${problems ? ' ⚠️' : ' ✅'}\n${H(lines)}\n\n${ai ? H(ai.slice(0, 2500)) : R.issues.length ? R.issues.map(i => '• ' + H(i)).join('\n') : 'Everything looks fine.'}${Object.keys(fixed).length ? '\n\n🔧 Auto-fixed: ' + H(JSON.stringify(fixed)) : ''}${ai ? '\n\n🤖 ' + H(GM.name) : aiErr ? '\n\n🤖 AI unavailable: ' + H(aiErr.slice(0, 200)) : '\n\nℹ️ Add GEMINI_API_KEY for AI explanations.'}`;
   return { problems, text, sig: R.issues.join('|') };
 }
 // ---------- 24/7: auto sync (new titles + new episodes, no commands needed) ----------

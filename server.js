@@ -47,6 +47,14 @@ async function dbSize() {
   return out;
 }
 const dbLine = a => a.map(x => x.down ? `${x.name} ❌ offline` : `${x.name} ${x.mb ?? '?'}/${LIMIT} MB`).join(' · ');
+// Serverless hosts (Vercel) start cold: wait until the databases are connected before answering, and say so clearly if they are not.
+const waitDb = () => new Promise(done => { const t0 = Date.now(), chk = () => { const ms = Date.now() - t0; if ((SH[0].conn.readyState === 1 && (SH.every(x => x.conn.readyState === 1) || ms > 3500)) || ms > 9000) return done(); setTimeout(chk, 100); }; chk(); });
+app.use(async (req, res, next) => {
+  if (!/^\/(api|img|dl|m|sitemap)/.test(req.path)) return next();
+  if (SH[0].conn.readyState !== 1 || !SH.every(x => x.conn.readyState === 1)) await waitDb();
+  if (!live().length) return res.status(503).json({ error: 'Database is not connected. Check the MONGODB_URI setting on this host.' });
+  next();
+});
 const allFull = () => !live().some(x => !x.full);
 const dropPosters = async () => { let n = 0; for (const sh of live()) { try { await sh.conn.collection('posters').drop(); n++; } catch {} } return n > 0; };
 
@@ -355,6 +363,11 @@ app.get('/dl/anime/:id/:n', async (req, res) => {
   try {
     const m = await Movie.findById(req.params.id, 'sourceUrl title type episodes'), n = +req.params.n, ep = m?.episodes?.[n];
     if (!m || m.type !== 'anime' || !ep) return res.status(404).send('Not found');
+    if (E.VERCEL) { // serverless cannot stream big files: use the always-on host (STREAM_HOST) or send the visitor straight to the file
+      if (E.STREAM_HOST) return res.redirect(`${E.STREAM_HOST.replace(/\/$/, '')}/dl/anime/${m.id}/${n}`);
+      const e = ep.url ? {} : animeList(await animeInfo(m.sourceUrl))[n] || {}, link = ep.url ? `https://cz.animeheaven.me/video.mp4?${ep.url}&d` : e.direct_link;
+      return link ? res.redirect(link) : res.status(502).send('Download source is not available right now.');
+    }
     const ac = new AbortController(); res.on('close', () => ac.abort());
     const hdr = { 'User-Agent': 'Mozilla/5.0', Referer: 'https://animeheaven.me/', ...(req.headers.range ? { Range: req.headers.range } : {}) };
     const get = async u => { try { const r = await fetch(u, { signal: ac.signal, headers: hdr }); return r.ok && !/text\/html/i.test(r.headers.get('content-type') || '') ? r : null; } catch { return null; } };
@@ -463,7 +476,8 @@ app.get('/sitemap.xml', wrap(async (req, res) => {
 }));
 app.get('/robots.txt', (req, res) => res.type('text/plain').send(`User-agent: *\nAllow: /\nDisallow: /api/\nDisallow: /dl/\nSitemap: ${baseUrl(req)}/sitemap.xml\n`));
 app.get('*', (req, res) => sendPage(req, res, { title: 'SHAGGY MOVIES – Download Movies, TV Series & Anime with Sinhala Subtitles', desc: 'Download the latest movies, TV series and anime with Sinhala subtitles in 480p, 720p and 1080p. Fast, simple and free.', path: '/' }));
-app.listen(E.PORT || 3000, () => console.log('SHAGGY MOVIES running'));
+if (!E.VERCEL) app.listen(E.PORT || 3000, () => console.log('SHAGGY MOVIES running'));
+module.exports = app; // Vercel uses this
 
 // ---------- Telegram admin bot ----------
 // Level 1: only Telegram IDs listed in ADMIN_TG_IDS get any answer (everyone else is ignored).
@@ -872,7 +886,7 @@ async function runAuto(chat) {
   finally { JOB.run = false; }
 }
 const SCHED = { sync: Date.now() - ((+E.AUTO_SYNC_MIN || 60) - 5) * 60e3, ai: Date.now() - ((+E.AI_SCAN_MIN || 120) - 6) * 60e3 }; // first runs ~5 minutes after start
-setInterval(async () => {
+const SCH = async () => {
   try {
     if (JOB.run || !IDS.length) return;
     const now = Date.now();
@@ -883,7 +897,8 @@ setInterval(async () => {
       else if (!r.problems) LASTDOC.sig = '';
     }
   } catch (e) { console.error('scheduler:', e.message); }
-}, 60e3);
+};
+if (!E.VERCEL) setInterval(SCH, 60e3);
 
 async function handle(u) {
   const cb = u.callback_query, msg = u.message, from = (cb || msg)?.from; if (!from) return;
@@ -1019,8 +1034,8 @@ async function poll() {
     for (const u of r.result) { off = u.update_id + 1; handle(u).catch(e => console.error('bot:', e.message)); }
   }
 }
-poll();
-setTimeout(async () => {
+if (!E.VERCEL) poll(); // the Telegram bot only runs on an always-on host
+if (!E.VERCEL) setTimeout(async () => {
   await dbSize();
   if (!(await Setting.findOne({ k: 'posters_v2' }).catch(() => null))) { // one time: the first full-size poster copies filled the database
     await dropPosters(); await dbSize(); await Setting.findOneAndUpdate({ k: 'posters_v2' }, { v: '1' }, { upsert: true }).catch(() => {});
@@ -1028,4 +1043,4 @@ setTimeout(async () => {
   await purgeBlocked(await blocked()).catch(() => {});
   warmPosters().catch(e => console.error('posters:', e.message));
 }, 20000); // after start: check database sizes, remove blocked servers, save missing posters
-setInterval(() => dbSize().catch(() => {}), 6e4);
+if (!E.VERCEL) setInterval(() => dbSize().catch(() => {}), 6e4);
